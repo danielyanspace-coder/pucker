@@ -161,7 +161,7 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
         // Lateral stability: no free-standing towers (docs/DECISIONS.md §4).
         if rule.use_lateral_stability {
             let g = rule.lateral_gap_mm + c;
-            let walls = place.has_walls();
+            let walls = place.holds_sides();
             let mut side = vec![[0i64; 4]; n];
             for (i, p) in items.iter().enumerate() {
                 let (fx, fy) = (p.depth as i64 * p.height as i64, p.width as i64 * p.height as i64);

@@ -170,7 +170,7 @@ impl<'a> BinState<'a> {
             min_cube: 1,
             ox,
             oy,
-            walls: place.has_walls(),
+            walls: place.holds_sides(),
             payload: place.payload_limit(),
             max_tilt_ratio: if tan > 0.0 { 1.0 / tan } else { f64::INFINITY },
             cell,

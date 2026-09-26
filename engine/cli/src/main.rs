@@ -154,6 +154,7 @@ fn parse_custom(spec: &str, n: usize) -> Result<PackingPlace, String> {
         max_overhang_y_mm: 0,
         use_pallet_base: false,
         pallet: None,
+        stretch_wrapped: None,
         door_width: None,
         door_height: None,
     })

@@ -893,6 +893,37 @@ fn search(
     SearchOutcome { best: elite.list.swap_remove(0), iterations, best_at, first_at: first_at.unwrap() }
 }
 
+/// Fill places one after another: each gets its own search that packs as much volume as
+/// possible (items may stay out), the rest moves on to the next place. The place that can
+/// take everything left gets all the remaining time and is packed as compactly as possible.
+/// For loads needing several places this beats one search over all places: the first place
+/// is filled much tighter, and the last one only holds what is left.
+fn sequential_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)], rule: &PackRule, seed: u64, until: Instant) -> (Solution, u64) {
+    let mut remaining: Vec<usize> = ids.to_vec();
+    let mut bins: Vec<BinSol> = Vec::new();
+    let mut iterations = 0;
+    let slots: Vec<(usize, &PackingPlace)> = pool.iter().flat_map(|&(pi, p)| std::iter::repeat((pi, p)).take(p.quantity as usize)).collect();
+    for (n, &(pi, place)) in slots.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        let vol: i64 = remaining.iter().map(|&i| items[i].volume).sum();
+        let last = vol as f64 <= 0.7 * place.usable_volume() as f64 || n + 1 == slots.len();
+        let share = if last { left } else { left.mul_f64(0.75) };
+        let single = PackingPlace { quantity: 1, ..place.clone() };
+        let one = [(pi, &single)];
+        let out = search(items, &remaining, &one, rule, seed ^ (0x5EED + n as u64), share.max(Duration::from_millis(50)));
+        iterations += out.iterations;
+        let Some(bin) = out.best.bins.into_iter().next() else { break };
+        let used: std::collections::HashSet<usize> = bin.placed.iter().map(|p| p.item).collect();
+        remaining.retain(|i| !used.contains(i));
+        bins.push(bin);
+    }
+    let unplaced = remaining.iter().map(|&i| (i, Reject::Bounds)).collect();
+    (summarize(bins, unplaced, pool), iterations)
+}
+
 /// With the split of items between places fixed, repack every place on its own with a
 /// dedicated search (worst places first) and keep the new layout when it is better.
 fn polish(items: &[PrepItem], mut sol: Solution, places: &[PackingPlace], rule: &PackRule, seed: u64, until: Instant) -> (Solution, u64) {
@@ -978,8 +1009,12 @@ pub fn pack(req: &PackingRequest) -> Result<PackingResult, String> {
     let mut iterations = 0;
     let mut best_at = 0;
     let mut first_solution = None;
-    // Most of the time goes to the global search, the rest to polishing each place.
-    let search_budget = total_budget * (1.0 - rule.polish_fraction);
+    // Most of the time goes to the search, the rest to polishing each place. When the load
+    // needs several places, most of the search fills them one after another instead.
+    let total_vol: i64 = ids.iter().map(|&i| items[i].volume).sum();
+    let multi = pools.len() == 1
+        && pools[0].first().is_some_and(|(_, p)| p.quantity >= 2 && total_vol as f64 > 0.75 * p.usable_volume() as f64);
+    let search_budget = total_budget * (1.0 - rule.polish_fraction) * if multi { 0.4 } else { 1.0 };
     for (k, pool) in pools.iter().enumerate() {
         let left = search_budget - t0.elapsed().as_secs_f64();
         let share = left / (pools.len() - k) as f64;
@@ -991,7 +1026,15 @@ pub fn pack(req: &PackingRequest) -> Result<PackingResult, String> {
             best = Some(out.best);
         }
     }
-    let best = best.unwrap();
+    let mut best = best.unwrap();
+    if multi {
+        let until = t0 + Duration::from_secs_f64(total_budget * (1.0 - rule.polish_fraction));
+        let (seq, its) = sequential_fill(&items, &ids, pools[0].as_slice(), rule, seed, until);
+        iterations += its;
+        if seq.better_than(&best) {
+            best = seq;
+        }
+    }
     let until = t0 + Duration::from_secs_f64(total_budget);
     let (best, polish_iterations) = polish(&items, best, places, rule, seed, until);
     iterations += polish_iterations;

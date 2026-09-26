@@ -79,6 +79,10 @@ pub struct PackingPlace {
     pub use_pallet_base: bool,
     #[serde(default)]
     pub pallet: Option<Pallet>,
+    /// The load is stretch-wrapped (standard for pallets): the wrap holds boxes at the
+    /// perimeter sideways like a wall. `None` = wrapped for pallets.
+    #[serde(default)]
+    pub stretch_wrapped: Option<bool>,
     #[serde(default)]
     pub door_width: Option<i32>,
     #[serde(default)]
@@ -93,6 +97,11 @@ impl PackingPlace {
     /// Rigid walls exist in vehicles and containers, not on a pallet.
     pub fn has_walls(&self) -> bool {
         self.place_type != PackingPlaceType::Pallet
+    }
+
+    /// Sides that hold boxes against tipping: rigid walls, or stretch wrap on a pallet.
+    pub fn holds_sides(&self) -> bool {
+        self.has_walls() || self.stretch_wrapped.unwrap_or(self.place_type == PackingPlaceType::Pallet)
     }
 
     /// Z where cargo starts (top of the pallet deck, or the floor).
@@ -234,9 +243,11 @@ impl PackRule {
     }
 }
 
-/// 200 kg/m² for class 1 rising linearly to 3000 kg/m² for class 10.
+/// 400 kg/m² for class 1 rising linearly to 4000 kg/m² for class 10. A full pallet column
+/// (1.6 m of goods at ~500 kg/m³) presses ~800 kg/m² on the bottom row, so the limit binds
+/// only for the weakest classes; the fragility rule already keeps fragile boxes on top.
 pub fn default_pressure_table() -> Vec<f64> {
-    (0..10).map(|i| 200.0 + i as f64 * (3000.0 - 200.0) / 9.0).collect()
+    (0..10).map(|i| 400.0 + i as f64 * 400.0).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

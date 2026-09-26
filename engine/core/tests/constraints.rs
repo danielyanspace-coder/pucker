@@ -37,6 +37,7 @@ fn place(kind: PackingPlaceType, dims: [i32; 3]) -> PackingPlace {
         max_overhang_y_mm: 0,
         use_pallet_base: false,
         pallet: None,
+        stretch_wrapped: None,
         door_width: None,
         door_height: None,
     }

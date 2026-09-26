@@ -204,33 +204,35 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                     }
                 }
             }
-            for (i, p) in items.iter().enumerate() {
-                if rule.is_standing(p.width, p.depth, p.height)
-                    && !crate::bin_state::enclosed(&side[i], p.width, p.depth, p.height, rule.standing_contact_ratio)
-                {
-                    push("STANDING_FREE", &bin.bin_id, &p.item_id, "Коробка стоит на ребре без соседей с обеих сторон".into());
-                }
-            }
-            let tan = rule.tilt_angle_deg.to_radians().tan();
-            let ratio = if tan > 0.0 { 1.0 / tan } else { f64::INFINITY };
-            let mut margin = vec![f64::INFINITY; n];
+            // Tipping per direction at transport accelerations (EN 12195-1).
+            let acc = crate::bin_state::tip_accels(place, rule);
+            let dims: Vec<[i32; 6]> = items.iter().map(|p| [p.x, p.y, p.z, p.width, p.depth, p.height]).collect();
+            let tied = crate::bin_state::tied_dirs(place, rule, &dims);
+            let boxes: Vec<crate::bin_state::TipBox> = items
+                .iter()
+                .enumerate()
+                .map(|(i, p)| crate::bin_state::TipBox {
+                    w: p.width,
+                    d: p.depth,
+                    h: p.height,
+                    side: side[i],
+                    supports: &supports[i],
+                    tied: tied[i],
+                })
+                .collect();
             let mut up: Vec<usize> = (0..n).collect();
             up.sort_by_key(|&i| items[i].z);
+            let margin = crate::bin_state::final_tip_margins(&boxes, &up, acc, rule);
             for &i in &up {
                 let p = &items[i];
-                let r = rule.lateral_min_contact_ratio;
-                let fx = p.depth as f64 * p.height as f64 * r;
-                let fy = p.width as f64 * p.height as f64 * r;
-                let s = side[i];
-                let braced = (s[0] as f64 >= fx) as u8 + (s[1] as f64 >= fx) as u8 + (s[2] as f64 >= fy) as u8 + (s[3] as f64 >= fy) as u8 >= rule.lateral_min_braced_sides;
-                if braced {
-                    continue;
-                }
-                let h = p.height as f64;
-                let own = p.width.min(p.depth) as f64 * ratio - h;
-                margin[i] = supports[i].iter().fold(own, |m, &(j, _)| m.min(margin[j] - h));
-                if margin[i] < -EPS {
-                    push("TOWER", &bin.bin_id, &p.item_id, format!("Неустойчивая стопка: не хватает {:.0} мм запаса на опрокидывание", -margin[i]));
+                if let Some(a) = (0..4).find(|&a| margin[i][a] < -EPS) {
+                    let own = crate::bin_state::own_margins(p.width, p.depth, p.height, acc);
+                    let dir = ["влево (−X)", "вправо (+X)", "вперёд (−Y)", "назад (+Y)"][a];
+                    let code = if own[a] < 0.0 { "STANDING_FREE" } else { "TOWER" };
+                    push(code, &bin.bin_id, &p.item_id, format!(
+                        "Опрокинется {} при {:.1} g: не хватает {:.0} мм запаса, с этой стороны коробку ничего не держит",
+                        dir, acc[a], -margin[i][a]
+                    ));
                 }
             }
         }

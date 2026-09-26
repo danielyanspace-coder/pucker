@@ -309,6 +309,9 @@ fn main() {
                 if filter.as_ref().is_some_and(|f| !sc.name.contains(f.as_str())) {
                     continue;
                 }
+                if let Ok(dir) = std::env::var("PUCKER_DUMP") {
+                    let _ = std::fs::write(format!("{}/{}.json", dir, sc.name.split_whitespace().next().unwrap_or("x")), serde_json::to_string(&sc.request).unwrap());
+                }
                 let r = pack(&sc.request)?;
                 let s = &r.summary;
                 let dense = if sc.dense_expected { if s.compactness >= 0.85 { " ≥85% ✓" } else { " <85% ✗" } } else { "" };

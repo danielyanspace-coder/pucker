@@ -11,6 +11,8 @@ use crate::prep::PrepItem;
 const EPS: f64 = 1e-9;
 /// Side gaps narrower than this are unlikely to be filled later.
 const NARROW_GAP: i32 = 120;
+/// Tipping reserve (mm) that counts as plenty when scoring positions.
+const RESERVE_MM: f64 = 600.0;
 const SIDE_NEG_X: usize = 0;
 const SIDE_POS_X: usize = 1;
 const SIDE_NEG_Y: usize = 2;
@@ -32,10 +34,10 @@ pub struct Placed {
     pub received: f64,
     /// Side contact area with neighbours or walls: -x, +x, -y, +y.
     pub side_contact: [i64; 4],
-    /// Tilt reserve of the free-standing (unbraced) stack this box tops, mm:
-    /// min over unbraced levels k below of `base_k / tan(tilt) - (top - bottom_k)`.
-    /// Infinite when the box is braced by neighbours or walls.
-    pub margin: f64,
+    /// Tipping reserve (mm) per direction (−x, +x, −y, +y) of the stack this box tops:
+    /// how much taller it could be before tipping at the transport acceleration.
+    /// Infinite in a direction where the box leans on a neighbour or wall.
+    pub margin: [f64; 4],
 }
 
 impl Placed {
@@ -133,7 +135,8 @@ pub struct BinState<'a> {
     oy: i32,
     walls: bool,
     payload: f64,
-    max_tilt_ratio: f64,
+    /// Accelerations (g) boxes must withstand without tipping, per direction.
+    acc: [f64; 4],
     // uniform grid of placed indices for spatial queries
     cell: i32,
     gx: i32,
@@ -152,7 +155,6 @@ impl<'a> BinState<'a> {
         let cell = 100;
         let gx = ((place.width + 2 * ox) / cell + 1).max(1);
         let gy = ((place.depth + 2 * oy) / cell + 1).max(1);
-        let tan = rule.tilt_angle_deg.to_radians().tan();
         let base_z = place.base_z();
         BinState {
             place,
@@ -172,7 +174,7 @@ impl<'a> BinState<'a> {
             oy,
             walls: place.holds_sides(),
             payload: place.payload_limit(),
-            max_tilt_ratio: if tan > 0.0 { 1.0 / tan } else { f64::INFINITY },
+            acc: tip_accels(place, rule),
             cell,
             gx,
             gy,
@@ -350,15 +352,14 @@ impl<'a> BinState<'a> {
         let sup = std::mem::take(&mut self.sup);
         let (side, flush) = self.side_contacts(x, y, z, w, d, h, false);
         let result = (|| {
-            if self.rule.use_lateral_stability
-                && !self.is_braced(&side, w, d, h)
-                && self.stack_margin(&sup, w, d, h) < -EPS
-            {
-                return Err(Reject::Lateral);
-            }
-            // A box standing on a narrow face must be held on both of its wide faces.
-            if self.rule.use_lateral_stability && self.rule.is_standing(w, d, h) && !enclosed(&side, w, d, h, self.rule.standing_contact_ratio) {
-                return Err(Reject::Lateral);
+            // Tipping reserve left for boxes that will stand on this one, 0..1.
+            let mut reserve = 1.0;
+            if self.rule.use_lateral_stability {
+                let m = self.tip_margins(&sup, &side, x, y, w, d, h);
+                if m.iter().any(|&v| v < -EPS) {
+                    return Err(Reject::Lateral);
+                }
+                reserve = m.iter().fold(f64::INFINITY, |a, &v| a.min(v)).min(RESERVE_MM) / RESERVE_MM;
             }
             // For scoring, the pallet edges act like walls: aligning to them is good.
             let mut side_score = side;
@@ -372,7 +373,15 @@ impl<'a> BinState<'a> {
             let bottom = support as f64 / foot_area as f64;
             let side_total: i64 = side_score.iter().sum();
             let side_max = 2 * (w as i64 + d as i64) * h as i64;
-            let contact = 0.4 * bottom + 0.6 * (side_total as f64 / side_max as f64).min(1.0);
+            // A box exactly on top of one of the same footprint builds a column: columns of
+            // equal boxes stand side by side and hold each other all the way up.
+            let column = sup.len() == 1 && {
+                let b = &self.placed[sup[0].0];
+                b.x == x && b.y == y && b.w == w && b.d == d
+            };
+            let flush = if column { 1.0 } else { flush };
+            let side_part = (side_total as f64 / side_max as f64).min(1.0);
+            let contact = 0.3 * bottom + 0.45 * side_part + 0.25 * reserve;
             Ok((contact, flush, void, self.narrow_gaps(x, y, z, w, d, h)))
         })();
         self.sup = sup;
@@ -508,22 +517,98 @@ impl<'a> BinState<'a> {
         (s, flush)
     }
 
-    /// Tilt reserve for an unbraced box of height `h` resting on `supports` (docs/DECISIONS.md §4):
-    /// the box itself and every unbraced level below must not tip over at the tilt angle.
-    fn stack_margin(&self, supports: &[(usize, i64)], w: i32, d: i32, h: i32) -> f64 {
-        let own = w.min(d) as f64 * self.max_tilt_ratio - h as f64;
-        supports.iter().fold(own, |m, &(j, _)| m.min(self.placed[j].margin - h as f64))
+    /// Tipping reserve in each of the four directions (docs/DECISIONS.md §4): unless the box
+    /// leans on a neighbour or wall on that side, the box and every free level below must
+    /// stay upright at that direction's transport acceleration. A box resting on a firm
+    /// support ties the other stacks under it (bonding), as in `final_tip_margins`.
+    #[allow(clippy::too_many_arguments)]
+    fn tip_margins(&self, supports: &[(usize, i64)], side: &[i64; 4], x: i32, y: i32, w: i32, d: i32, h: i32) -> [f64; 4] {
+        if self.tied(x, y, w, d) {
+            return [f64::INFINITY; 4];
+        }
+        let own = own_margins(w, d, h, self.acc);
+        let held = held_dirs(side, w, d, h, own, self.rule);
+        let foot = w as i64 * d as i64;
+        let mut m = [f64::INFINITY; 4];
+        for a in 0..4 {
+            if held[a] {
+                continue;
+            }
+            m[a] = supports.iter().fold(own[a], |acc, &(j, area)| {
+                let b = &self.placed[j];
+                let bridged = area * 5 >= foot.min(b.w as i64 * b.d as i64)
+                    && supports.iter().any(|&(k, ka)| k != j && ka * 4 >= foot && self.placed[k].margin[a] >= -EPS);
+                if bridged { acc } else { acc.min(b.margin[a] - h as f64) }
+            });
+        }
+        m
     }
 
-    fn is_braced(&self, side: &[i64; 4], w: i32, d: i32, h: i32) -> bool {
-        let r = self.rule.lateral_min_contact_ratio;
-        let fx = d as f64 * h as f64 * r;
-        let fy = w as f64 * h as f64 * r;
-        let n = (side[SIDE_NEG_X] as f64 >= fx) as u8
-            + (side[SIDE_POS_X] as f64 >= fx) as u8
-            + (side[SIDE_NEG_Y] as f64 >= fy) as u8
-            + (side[SIDE_POS_Y] as f64 >= fy) as u8;
-        n >= self.rule.lateral_min_braced_sides
+    /// Recompute every box's tipping reserve after a change (new contacts, new bonds).
+    fn refresh_margins(&mut self) {
+        let n = self.placed.len();
+        let boxes: Vec<TipBox> = self
+            .placed
+            .iter()
+            .map(|p| TipBox { w: p.w, d: p.d, h: p.h, side: p.side_contact, supports: &p.supports, tied: [self.tied(p.x, p.y, p.w, p.d); 4] })
+            .collect();
+        let order: Vec<usize> = (0..n).collect();
+        let margin = final_tip_margins(&boxes, &order, self.acc, self.rule);
+        drop(boxes);
+        for (p, m) in self.placed.iter_mut().zip(margin) {
+            p.margin = m;
+        }
+    }
+
+    /// On the perimeter of a stretch-wrapped pallet (touching the film).
+    fn tied(&self, x: i32, y: i32, w: i32, d: i32) -> bool {
+        let g = self.rule.lateral_gap_mm + self.rule.clearance_mm;
+        self.place.wrap_ties() && (x <= g || y <= g || x + w >= self.place.width - g || y + d >= self.place.depth - g)
+    }
+
+    /// Final tipping check of the finished load (docs/DECISIONS.md §4), including the load
+    /// securing the result asks for (`tied_dirs`). Boxes that neither are held nor stand on
+    /// their own in some direction are taken out together with everything resting on them,
+    /// and the rest is rebuilt; repeated until stable. Returns the removed items.
+    pub fn settle(&mut self, items: &[PrepItem]) -> Vec<usize> {
+        let mut removed = Vec::new();
+        if !self.rule.use_lateral_stability {
+            return removed;
+        }
+        loop {
+            let n = self.placed.len();
+            let dims: Vec<[i32; 6]> = self.placed.iter().map(|p| [p.x, p.y, p.z, p.w, p.d, p.h]).collect();
+            let tied = tied_dirs(self.place, self.rule, &dims);
+            let boxes: Vec<TipBox> = self
+                .placed
+                .iter()
+                .zip(tied)
+                .map(|(p, t)| TipBox { w: p.w, d: p.d, h: p.h, side: p.side_contact, supports: &p.supports, tied: t })
+                .collect();
+            // Supports are always placed earlier, so index order is bottom-up.
+            let order: Vec<usize> = (0..n).collect();
+            let margin = final_tip_margins(&boxes, &order, self.acc, self.rule);
+            drop(boxes);
+            let mut drop = vec![false; n];
+            for i in 0..n {
+                drop[i] = self.placed[i].supports.iter().any(|&(j, _)| drop[j]) || margin[i].iter().any(|&m| m < -EPS);
+            }
+            if !drop.contains(&true) {
+                break;
+            }
+            let mut nb = BinState::new(self.place, self.place_index, self.rule);
+            nb.min_cube = self.min_cube;
+            nb.max_h = self.max_h;
+            for (i, p) in std::mem::take(&mut self.placed).into_iter().enumerate() {
+                if drop[i] {
+                    removed.push(p.item);
+                } else {
+                    nb.place(items, p.item, &Candidate { orient: p.orient, x: p.x, y: p.y, z: p.z, score: 0.0 });
+                }
+            }
+            *self = nb;
+        }
+        removed
     }
 
     /// Would pushing `weight` down through `supports` overload any box below?
@@ -770,8 +855,7 @@ impl<'a> BinState<'a> {
 
         let (side, _) = self.side_contacts(x, y, z, w, d, h, true);
         let neighbours: Vec<usize> = self.buf.clone();
-        let braced = self.is_braced(&side, w, d, h);
-        let margin = if braced { f64::INFINITY } else { self.stack_margin(&supports, w, d, h) };
+        let margin = self.tip_margins(&supports, &side, x, y, w, d, h);
 
         // Push the load down.
         let mut pending: Vec<(usize, f64)> = Vec::new();
@@ -808,17 +892,11 @@ impl<'a> BinState<'a> {
                 add[SIDE_NEG_Y] += ox * oz;
             }
             if add.iter().any(|&a| a > 0) {
-                let (bw, bd, bh) = (b.w, b.d, b.h);
                 let mut s = b.side_contact;
                 for k in 0..4 {
                     s[k] += add[k];
                 }
-                let now_braced = self.is_braced(&s, bw, bd, bh);
-                let b = &mut self.placed[j];
-                b.side_contact = s;
-                if now_braced {
-                    b.margin = f64::INFINITY;
-                }
+                self.placed[j].side_contact = s;
             }
         }
 
@@ -839,6 +917,9 @@ impl<'a> BinState<'a> {
             margin,
         });
         self.stamp.push(0);
+        if self.rule.use_lateral_stability {
+            self.refresh_margins();
+        }
         let (cx0, cy0, cx1, cy1) = self.cells(x - c, y - c, x + w + c, y + d + c);
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
@@ -922,20 +1003,144 @@ impl<'a> BinState<'a> {
     }
 }
 
-/// Is a standing box held on both sides across its thin direction (docs/DECISIONS.md §4b)?
-/// `side` is contact area per side: -x, +x, -y, +y.
-pub fn enclosed(side: &[i64; 4], w: i32, d: i32, h: i32, ratio: f64) -> bool {
-    let fx = d as f64 * h as f64 * ratio;
-    let fy = w as f64 * h as f64 * ratio;
-    let across_x = side[SIDE_NEG_X] as f64 >= fx && side[SIDE_POS_X] as f64 >= fx;
-    let across_y = side[SIDE_NEG_Y] as f64 >= fy && side[SIDE_POS_Y] as f64 >= fy;
-    // Thin along x when w < d: it would tip over the x sides.
-    if w < d {
-        across_x
-    } else if d < w {
-        across_y
+/// Accelerations (in g) a box must withstand without tipping, per direction
+/// (−x, +x, −y, +y). Road transport (EN 12195-1): 0.5 g sideways and rearwards, 0.8 g
+/// forwards when braking. In vehicles and containers the front wall is at y = 0 (loading
+/// starts there, doors at the far end), so braking throws the cargo towards −y. A pallet
+/// may be loaded either way round, so it gets 0.5 g in every direction (EUMOS 40509).
+pub fn tip_accels(place: &crate::model::PackingPlace, rule: &PackRule) -> [f64; 4] {
+    let lat = rule.accel_lateral_g.max(0.01);
+    if place.place_type == crate::model::PackingPlaceType::Pallet {
+        [lat; 4]
     } else {
-        across_x || across_y
+        [lat, lat, rule.accel_longitudinal_g.max(lat), lat]
+    }
+}
+
+/// Reserve (mm) of a free-standing box against tipping in each direction: a uniform box tips
+/// when a·h/2 > b/2, so it stays upright while h ≤ b / a.
+pub fn own_margins(w: i32, d: i32, h: i32, acc: [f64; 4]) -> [f64; 4] {
+    let (w, d, h) = (w as f64, d as f64, h as f64);
+    [w / acc[0] - h, w / acc[1] - h, d / acc[2] - h, d / acc[3] - h]
+}
+
+/// Is the box blocked from tipping in each direction, i.e. does it lean on a neighbour, wall
+/// or stretch wrap on that side? A box that could not stand on its own in that direction
+/// needs `standing_contact_ratio` of the face touched, others `lateral_min_contact_ratio`.
+pub fn held_dirs(side: &[i64; 4], w: i32, d: i32, h: i32, own: [f64; 4], rule: &PackRule) -> [bool; 4] {
+    let face = [d, d, w, w];
+    let mut held = [false; 4];
+    for k in 0..4 {
+        let ratio = if own[k] < 0.0 { rule.standing_contact_ratio } else { rule.lateral_min_contact_ratio };
+        held[k] = side[k] as f64 >= face[k] as f64 * h as f64 * ratio;
+    }
+    held
+}
+
+/// One box for the final tipping check: size, side contacts (−x, +x, −y, +y) and the boxes
+/// it rests on with contact areas.
+pub struct TipBox<'b> {
+    pub w: i32,
+    pub d: i32,
+    pub h: i32,
+    pub side: [i64; 4],
+    pub supports: &'b [(usize, i64)],
+    /// Directions held by securing rather than by neighbours: the stretch wrap for boxes on
+    /// the perimeter of a pallet (every way), a strap or load bar across the rear face of
+    /// the load in a vehicle (+y).
+    pub tied: [bool; 4],
+}
+
+/// Directions each box ([x, y, z, w, d, h]) is held in by load securing (see `TipBox::tied`).
+pub fn tied_dirs(place: &crate::model::PackingPlace, rule: &PackRule, boxes: &[[i32; 6]]) -> Vec<[bool; 4]> {
+    let g = rule.lateral_gap_mm + rule.clearance_mm;
+    if place.wrap_ties() {
+        return boxes
+            .iter()
+            .map(|&[x, y, _, w, d, _]| {
+                let t = x <= g || y <= g || x + w >= place.width - g || y + d >= place.depth - g;
+                [t; 4]
+            })
+            .collect();
+    }
+    if !place.has_walls() || !rule.secure_rear_face {
+        return vec![[false; 4]; boxes.len()];
+    }
+    // The strap across the rear face reaches a box when nothing stands behind it.
+    boxes
+        .iter()
+        .map(|&[x, y, z, w, d, h]| {
+            let hidden = boxes.iter().any(|&[bx, by, bz, bw, _, bh]| {
+                by >= y + d && overlap(x, x + w, bx, bx + bw) > 0 && overlap(z, z + h, bz, bz + bh) > 0
+            });
+            [false, false, false, !hidden]
+        })
+        .collect()
+}
+
+/// Tipping reserve per box and direction in the finished load (docs/DECISIONS.md §4);
+/// negative = the box (with the stack under it) tips at the transport acceleration.
+/// `order` lists the boxes bottom-up. A box is held in a direction when
+/// - it is tied by securing (`TipBox::tied`), or
+/// - it leans on a neighbour or wall on that side (`held_dirs`), or
+/// - a box resting on it cannot move that way: that box is itself held, or also rests on
+///   another box that stands firm (bonding, «перевязка»: the bridge ties the stacks and
+///   friction under it keeps the top of this stack in place); held tops pass this down
+///   the column.
+///
+/// Everything else must stand on its own: the box and every free level under it.
+/// Holding is only derived from boxes already known to be firm, so boxes never hold
+/// each other up in a circle.
+pub fn final_tip_margins(boxes: &[TipBox], order: &[usize], acc: [f64; 4], rule: &PackRule) -> Vec<[f64; 4]> {
+    let n = boxes.len();
+    let foot = |i: usize| boxes[i].w as i64 * boxes[i].d as i64;
+    let mut above: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
+    for (u, b) in boxes.iter().enumerate() {
+        for &(j, a) in b.supports {
+            above[j].push((u, a));
+        }
+    }
+    let own: Vec<[f64; 4]> = boxes.iter().map(|b| own_margins(b.w, b.d, b.h, acc)).collect();
+    let mut fixed: Vec<[bool; 4]> = boxes
+        .iter()
+        .zip(&own)
+        .map(|(b, o)| {
+            let f = held_dirs(&b.side, b.w, b.d, b.h, *o, rule);
+            std::array::from_fn(|k| f[k] || b.tied[k])
+        })
+        .collect();
+    let mut margin = vec![[f64::INFINITY; 4]; n];
+    loop {
+        for &i in order {
+            let b = &boxes[i];
+            for a in 0..4 {
+                margin[i][a] = if fixed[i][a] {
+                    f64::INFINITY
+                } else {
+                    b.supports.iter().fold(own[i][a], |m, &(j, _)| m.min(margin[j][a] - b.h as f64))
+                };
+            }
+        }
+        let mut changed = false;
+        for i in 0..n {
+            for a in 0..4 {
+                if fixed[i][a] {
+                    continue;
+                }
+                let tied = above[i].iter().any(|&(u, area)| {
+                    area * 5 >= foot(i).min(foot(u))
+                        && (fixed[u][a]
+                            || boxes[u].supports.iter().any(|&(k, ka)| k != i && ka * 4 >= foot(u) && margin[k][a] >= -EPS))
+                });
+                if tied {
+                    fixed[i][a] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return margin;
+        }
     }
 }
 

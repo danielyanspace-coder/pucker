@@ -165,45 +165,76 @@ impl<'a> SeqCtx<'a> {
     /// as needed. Returns the items that fit nowhere.
     fn place_all(&self, list: &[usize], bins: &mut Vec<BinState<'a>>, used: &mut [u32], rng: &mut Rng) -> Vec<(usize, Reject)> {
         let items = self.items;
+        // Boxes that do not fit the open places yet are set aside and retried after the
+        // others: a box may need neighbours that come later (to be held against tipping),
+        // and a new place should only be opened for what really does not fit.
+        let mut waiting: Vec<(usize, Reject)> = list.iter().map(|&i| (i, Reject::Bounds)).collect();
         let mut unplaced = Vec::new();
-        for &idx in list {
-            let mut furthest = Reject::Bounds;
-            let mut done = false;
+        // Retry only after something changed, and at most twice in a row: an unbounded
+        // "until nothing moves" loop is quadratic on big loads.
+        let mut changed = true;
+        loop {
+            // Offer everything waiting to the open places.
+            let mut passes = 0;
+            while changed && passes < 2 {
+                passes += 1;
+                let before = waiting.len();
+                let mut still = Vec::new();
+                for (idx, r) in waiting {
+                    if let Err(r2) = self.place_in_open(idx, bins, rng) {
+                        still.push((idx, r.max(r2)));
+                    }
+                }
+                waiting = still;
+                changed = !waiting.is_empty() && waiting.len() != before;
+            }
+            if waiting.is_empty() {
+                break;
+            }
+            // Open a new place with the first box still waiting, then go round again.
+            let (idx, mut furthest) = waiting.remove(0);
             let share = items[idx].volume as f64 / self.max_vol;
-            for b in bins.iter_mut() {
-                match b.best_candidate(items, idx, &self.wts, share, self.max_seeds, rng) {
+            let mut done = false;
+            for (k, &(pi, place)) in self.pool.iter().enumerate() {
+                if used[k] >= place.quantity || !fits_empty(&items[idx], place) {
+                    continue;
+                }
+                let mut nb = BinState::new(place, pi, self.rule);
+                nb.min_cube = self.min_cube;
+                match nb.best_candidate(items, idx, &self.wts, share, self.max_seeds, rng) {
                     Ok(c) => {
-                        b.place(items, idx, &c);
+                        nb.place(items, idx, &c);
+                        bins.push(nb);
+                        used[k] += 1;
                         done = true;
                         break;
                     }
                     Err(r) => furthest = furthest.max(r),
                 }
             }
-            if !done {
-                for (k, &(pi, place)) in self.pool.iter().enumerate() {
-                    if used[k] >= place.quantity || !fits_empty(&items[idx], place) {
-                        continue;
-                    }
-                    let mut nb = BinState::new(place, pi, self.rule);
-                    nb.min_cube = self.min_cube;
-                    match nb.best_candidate(items, idx, &self.wts, share, self.max_seeds, rng) {
-                        Ok(c) => {
-                            nb.place(items, idx, &c);
-                            bins.push(nb);
-                            used[k] += 1;
-                            done = true;
-                            break;
-                        }
-                        Err(r) => furthest = furthest.max(r),
-                    }
-                }
-            }
-            if !done {
+            if done {
+                changed = true;
+            } else {
                 unplaced.push((idx, furthest));
             }
         }
         unplaced
+    }
+
+    /// Place the item into the first open place that takes it.
+    fn place_in_open(&self, idx: usize, bins: &mut [BinState<'a>], rng: &mut Rng) -> Result<(), Reject> {
+        let share = self.items[idx].volume as f64 / self.max_vol;
+        let mut furthest = Reject::Bounds;
+        for b in bins.iter_mut() {
+            match b.best_candidate(self.items, idx, &self.wts, share, self.max_seeds, rng) {
+                Ok(c) => {
+                    b.place(self.items, idx, &c);
+                    return Ok(());
+                }
+                Err(r) => furthest = furthest.max(r),
+            }
+        }
+        Err(furthest)
     }
 }
 
@@ -242,16 +273,108 @@ fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)],
         }
         unplaced = ctx.place_all(&rest, &mut bins, &mut used, &mut rng);
     }
-    let bins: Vec<BinSol> = bins
-        .into_iter()
-        .map(|b| {
-            let metrics = bin_metrics(b.place, &views(items, &b.placed, b.place.base_z()));
-            BinSol { place_index: b.place_index, placed: b.placed, metrics }
-        })
-        .collect();
+    let bins = finish_bins(items, bins, &mut unplaced, &wts, max_vol, max_seeds, &mut rng);
     let mut sol = summarize(bins, unplaced, pool);
     sol.start = Some(Start { order: Some(used_order), ..s.clone() });
     sol
+}
+
+/// Final tipping check of every place (`BinState::settle`); boxes it takes out are offered
+/// once more to all places, and otherwise stay unplaced.
+#[allow(clippy::too_many_arguments)]
+fn finish_bins(
+    items: &[PrepItem],
+    mut bins: Vec<BinState>,
+    unplaced: &mut Vec<(usize, Reject)>,
+    wts: &Weights,
+    max_vol: f64,
+    max_seeds: usize,
+    rng: &mut Rng,
+) -> Vec<BinSol> {
+    let mut removed: Vec<usize> = bins.iter_mut().flat_map(|b| b.settle(items)).collect();
+    removed.sort_by(|&a, &b| items[b].volume.cmp(&items[a].volume));
+    for idx in removed {
+        let share = items[idx].volume as f64 / max_vol;
+        let mut done = false;
+        for b in bins.iter_mut() {
+            if let Ok(c) = b.best_candidate(items, idx, wts, share, max_seeds, rng) {
+                b.place(items, idx, &c);
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            unplaced.push((idx, Reject::Lateral));
+        }
+    }
+    bins.into_iter()
+        .filter(|b| !b.placed.is_empty())
+        .map(|b| {
+            let metrics = bin_metrics(b.place, &views(items, &b.placed, b.base_z));
+            BinSol { place_index: b.place_index, placed: b.placed, metrics }
+        })
+        .collect()
+}
+
+/// What the load needs in transport for the stability check to hold (docs/DECISIONS.md §4):
+/// stretch wrap on pallets, a strap or bar across the rear face in vehicles, and securing of
+/// a pallet that would tip over as a whole at the sideways acceleration.
+fn securing_warnings(req: &PackingRequest, bins: &[PackedBin]) -> Vec<Warning> {
+    let rule = &req.pack_rule;
+    let mut out = Vec::new();
+    if !rule.use_lateral_stability {
+        return out;
+    }
+    let names = |f: &dyn Fn(&PackingPlace) -> bool| -> Vec<String> {
+        bins.iter()
+            .filter(|b| req.available_packing_places.iter().any(|p| p.id == b.place_id && f(p)))
+            .map(|b| b.bin_id.clone())
+            .collect()
+    };
+    let wrapped = names(&|p| p.wrap_ties());
+    if !wrapped.is_empty() {
+        out.push(Warning {
+            code: "SECURE_STRETCH_WRAP".into(),
+            severity: Severity::Info,
+            message: format!(
+                "{}: обмотайте стрейч-плёнкой от поддона до верха груза, с захлёстом на поддон. \
+                 Расчёт устойчивости крайних коробок опирается на плёнку.",
+                wrapped.join(", ")
+            ),
+        });
+    }
+    let rear = names(&|p| p.has_walls());
+    if !rear.is_empty() && rule.secure_rear_face {
+        out.push(Warning {
+            code: "SECURE_REAR_FACE".into(),
+            severity: Severity::Info,
+            message: format!(
+                "{}: груз ставится вплотную к передней стенке; задний торец закрепите ремнём или \
+                 распорной штангой — задний ряд без крепления может опрокинуться при разгоне.",
+                rear.join(", ")
+            ),
+        });
+    }
+    // A pallet as a whole: tips when a·h_cg > distance from the CG to the edge.
+    let a = rule.accel_lateral_g;
+    for b in bins.iter().filter(|b| b.place_type == PackingPlaceType::Pallet && b.item_weight > 0.0) {
+        let [cx, cy, cz] = b.center_of_mass;
+        let total = b.item_weight + b.pallet_weight;
+        let h_cg = (b.item_weight * cz + b.pallet_weight * b.base_z as f64 / 2.0) / total.max(1e-9);
+        let edge = cx.min(b.width as f64 - cx).min(cy).min(b.depth as f64 - cy);
+        if a * h_cg > edge {
+            out.push(Warning {
+                code: "PALLET_MAY_TIP".into(),
+                severity: Severity::Warning,
+                message: format!(
+                    "{}: центр тяжести на высоте {:.0} мм — при {:.1} g палета целиком может опрокинуться. \
+                     В кузове ставьте её вплотную к другим палетам или к стенке и крепите ремнём.",
+                    b.bin_id, h_cg, a
+                ),
+            });
+        }
+    }
+    out
 }
 
 /// Identical physical units share one type so each position is tried once per type.
@@ -360,19 +483,14 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
             break;
         }
     }
-    let unplaced = types
+    let mut unplaced = types
         .iter()
         .enumerate()
         .flat_map(|(t, v)| v.iter().map(move |&i| (i, t)))
         .map(|(i, t)| (i, furthest[t]))
         .collect();
-    let done: Vec<BinSol> = bins
-        .into_iter()
-        .map(|b| {
-            let metrics = bin_metrics(b.place, &views(items, &b.placed, b.base_z));
-            BinSol { place_index: b.place_index, placed: b.placed, metrics }
-        })
-        .collect();
+    let max_seeds = if ids.len() <= 600 { usize::MAX } else { 64 };
+    let done = finish_bins(items, bins, &mut unplaced, &s.wts, max_vol, max_seeds, &mut rng);
     let mut sol = summarize(done, unplaced, pool);
     sol.start = Some(Start { bias: Some(bias), ..s.clone() });
     sol
@@ -1166,6 +1284,7 @@ fn build_result(
             ),
         });
     }
+    warnings.extend(securing_warnings(req, &bins_out));
     if req.available_packing_places.iter().any(|p| p.use_pallet_base && p.place_type != PackingPlaceType::Pallet) {
         warnings.push(Warning {
             code: "PALLET_BASE_IGNORED".into(),

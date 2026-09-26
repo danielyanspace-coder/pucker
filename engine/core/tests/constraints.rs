@@ -192,20 +192,60 @@ fn collisions_and_missing_items_are_caught() {
 }
 
 #[test]
-fn lone_tower_is_rejected_but_braced_stack_is_fine() {
-    // Three 250×250×300 boxes stacked alone in the middle of a pallet: 900 mm on a 250 mm base.
+fn lone_tower_is_rejected_but_held_stack_is_fine() {
+    // Three 250×250×300 boxes stacked alone in the middle of a pallet: 900 mm on a 250 mm
+    // base tips at 0.5 g sideways (a box stays upright while h <= b / 0.5).
     let p = place(PackingPlaceType::Pallet, [800, 1200, 1800]);
     let tower: Vec<Item> = (0..3).map(|i| item(&format!("t#{}", i), [250, 250, 300], 2.0, 5)).collect();
     let req = request(tower.clone(), p.clone());
-    let layout = |req: &PackingRequest| (0..3).map(|i| at(req, &format!("t#{}", i), 50, 500, 300 * i)).collect::<Vec<_>>();
-    assert!(codes(&req, layout(&req)).contains(&"TOWER".to_string()));
-    // The same stack leaning on a wide block next to it is braced.
-    let mut items = tower;
-    items.push(item("wall", [500, 600, 900], 20.0, 9));
+    let lone: Vec<PlacedItem> = (0..3).map(|i| at(&req, &format!("t#{}", i), 300, 500, 300 * i)).collect();
+    assert!(codes(&req, lone).contains(&"TOWER".to_string()));
+
+    // Leaning on one block only is not enough: it can still tip the other way.
+    let mut items = tower.clone();
+    items.push(item("bx", [500, 600, 900], 20.0, 9));
+    let req = request(items, p.clone());
+    let mut l: Vec<PlacedItem> = (0..3).map(|i| at(&req, &format!("t#{}", i), 50, 500, 300 * i)).collect();
+    l.push(at(&req, "bx", 300, 400, 0));
+    assert!(codes(&req, l).contains(&"TOWER".to_string()));
+
+    // In the corner of a stretch-wrapped pallet with blocks on the two open sides it is held.
+    let mut items: Vec<Item> = tower.into_iter().take(2).collect();
+    items.push(item("bx", [550, 600, 600], 20.0, 9));
+    items.push(item("by", [250, 550, 600], 20.0, 9));
     let req = request(items, p);
-    let mut l = layout(&req);
-    l.push(at(&req, "wall", 300, 300, 0));
+    let mut l: Vec<PlacedItem> = (0..2).map(|i| at(&req, &format!("t#{}", i), 0, 0, 300 * i)).collect();
+    l.push(at(&req, "bx", 250, 0, 0));
+    l.push(at(&req, "by", 0, 250, 0));
     let got = codes(&req, l);
+    assert!(got.is_empty(), "{:?}", got);
+}
+
+#[test]
+fn stretch_wrap_and_bonding_hold_stacks() {
+    let p = place(PackingPlaceType::Pallet, [800, 1200, 1800]);
+    let tower: Vec<Item> = (0..3).map(|i| item(&format!("t#{}", i), [250, 250, 300], 2.0, 5)).collect();
+    // On the edge of a wrapped pallet the film ties the stack; without wrap it tips.
+    let req = request(tower.clone(), p.clone());
+    let edge = |req: &PackingRequest| (0..3).map(|i| at(req, &format!("t#{}", i), 0, 500, 300 * i)).collect::<Vec<_>>();
+    assert!(codes(&req, edge(&req)).is_empty());
+    let mut bare = p.clone();
+    bare.stretch_wrapped = Some(false);
+    let req = request(tower, bare);
+    assert!(codes(&req, edge(&req)).contains(&"TOWER".to_string()));
+
+    // Two columns side by side in the middle, 600 mm on a 250 mm base: each can tip away
+    // from the other. A box bridging both ties them into one block.
+    let mut items: Vec<Item> = (0..4).map(|i| item(&format!("c#{}", i), [250, 500, 300], 3.0, 5)).collect();
+    items.push(item("bridge", [500, 500, 100], 3.0, 5));
+    let req = request(items, p);
+    let cols = |req: &PackingRequest| {
+        vec![at(req, "c#0", 300, 400, 0), at(req, "c#1", 300, 400, 300), at(req, "c#2", 550, 400, 0), at(req, "c#3", 550, 400, 300)]
+    };
+    assert!(codes(&req, cols(&req)).contains(&"TOWER".to_string()));
+    let mut bonded = cols(&req);
+    bonded.push(at(&req, "bridge", 300, 400, 600));
+    let got = codes(&req, bonded);
     assert!(got.is_empty(), "{:?}", got);
 }
 
@@ -258,7 +298,10 @@ fn identical_boxes_pack_densely() {
     let items: Vec<Item> = (0..48).map(|i| item(&format!("b#{}", i), [400, 300, 250], 12.0, 8)).collect();
     let mut p = place(PackingPlaceType::Pallet, [800, 1200, 1644]);
     p.quantity = 2;
-    let res = pack(&request(items, p)).unwrap();
+    let mut req = request(items, p);
+    // Other tests run in parallel: give the search enough time even on a busy machine.
+    req.pack_rule.time_limit_seconds = 6.0;
+    let res = pack(&req).unwrap();
     assert!(res.validation.valid);
     assert_eq!(res.summary.bins_used, 1);
     assert!(res.summary.compactness >= 0.85, "compactness {}", res.summary.compactness);

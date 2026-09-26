@@ -104,6 +104,12 @@ impl PackingPlace {
         self.has_walls() || self.stretch_wrapped.unwrap_or(self.place_type == PackingPlaceType::Pallet)
     }
 
+    /// Stretch-wrapped pallet: the film ties every box on the perimeter to the load unit,
+    /// so such a box can tip neither out nor into the load (EUMOS 40509 unit test).
+    pub fn wrap_ties(&self) -> bool {
+        !self.has_walls() && self.holds_sides()
+    }
+
     /// Z where cargo starts (top of the pallet deck, or the floor).
     pub fn base_z(&self) -> i32 {
         match (&self.pallet, self.place_type) {
@@ -170,14 +176,18 @@ pub struct PackRule {
     pub standing_support_ratio: f64,
     /// …and neighbours or walls covering this share of each of its two wide faces.
     pub standing_contact_ratio: f64,
-    /// Tilt angle a free-standing stack must survive.
-    pub tilt_angle_deg: f64,
+    /// Transport accelerations (g) boxes must withstand without tipping (EN 12195-1 road):
+    /// sideways, and forward along the travel direction (y) in vehicles.
+    pub accel_lateral_g: f64,
+    pub accel_longitudinal_g: f64,
+    /// In vehicles and containers the rear face of the load (towards the doors) is secured
+    /// with a strap or load bar; the result then says so. Off = the rear row must stand on
+    /// its own when the vehicle pulls away.
+    pub secure_rear_face: bool,
     /// Side counts as braced when contact covers at least this share of the face.
     pub lateral_min_contact_ratio: f64,
     /// Neighbours closer than this still count as touching.
     pub lateral_gap_mm: i32,
-    /// A box counts as braced when this many of its 4 sides are in contact.
-    pub lateral_min_braced_sides: u8,
     pub target_compactness: f64,
     /// Hard limit on search time.
     pub time_limit_seconds: f64,
@@ -210,10 +220,11 @@ impl Default for PackRule {
             standing_ratio: 2.0,
             standing_support_ratio: 0.9,
             standing_contact_ratio: 0.5,
-            tilt_angle_deg: 20.0,
+            accel_lateral_g: 0.5,
+            accel_longitudinal_g: 0.8,
+            secure_rear_face: true,
             lateral_min_contact_ratio: 0.20,
             lateral_gap_mm: 20,
-            lateral_min_braced_sides: 1,
             target_compactness: 0.85,
             time_limit_seconds: 180.0,
             auto_time: true,

@@ -104,8 +104,7 @@ impl PackingPlace {
         self.has_walls() || self.stretch_wrapped.unwrap_or(self.place_type == PackingPlaceType::Pallet)
     }
 
-    /// Stretch-wrapped pallet: the film ties every box on the perimeter to the load unit,
-    /// so such a box can tip neither out nor into the load (EUMOS 40509 unit test).
+    /// Stretch-wrapped pallet: the film keeps boxes on the perimeter from falling out.
     pub fn wrap_ties(&self) -> bool {
         !self.has_walls() && self.holds_sides()
     }
@@ -184,6 +183,13 @@ pub struct PackRule {
     /// with a strap or load bar; the result then says so. Off = the rear row must stand on
     /// its own when the vehicle pulls away.
     pub secure_rear_face: bool,
+    /// Safety factor on the accelerations for tipping: a load designed exactly at the limit
+    /// falls over in a real ride (sway, bumps). Checked in the shake test at 1.0.
+    pub tip_safety_factor: f64,
+    /// Static friction between cardboard boxes and on the pallet (EN 12195-1 Annex B: about
+    /// 0.5–0.6). A box pushed by a neighbour slides once the push exceeds what friction
+    /// has left over the transport force.
+    pub friction: f64,
     /// Side counts as braced when contact covers at least this share of the face.
     pub lateral_min_contact_ratio: f64,
     /// Neighbours closer than this still count as touching.
@@ -223,6 +229,8 @@ impl Default for PackRule {
             accel_lateral_g: 0.5,
             accel_longitudinal_g: 0.8,
             secure_rear_face: true,
+            tip_safety_factor: 1.3,
+            friction: 0.6,
             lateral_min_contact_ratio: 0.20,
             lateral_gap_mm: 20,
             target_compactness: 0.85,

@@ -95,6 +95,7 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
         // A top up to `support_tolerance_mm` below the bottom still carries the box.
         let stol = rule.support_tolerance_mm;
         let mut supports: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
+        let mut levers = vec![[0.0f64; 4]; n];
         for (i, p) in items.iter().enumerate() {
             let foot = Rect::new(p.x, p.y, p.width, p.depth);
             let mut rects = Vec::new();
@@ -114,6 +115,7 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                 }
             }
             let area = union_area(&rects);
+            levers[i] = crate::bin_state::box_levers(&rects, p.x, p.y, p.width, p.depth);
             let ratio = area as f64 / foot.area() as f64;
             let need = rule.required_support(p.width, p.depth, p.height);
             if ratio + 1e-9 < need {
@@ -162,14 +164,18 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
         if rule.use_lateral_stability {
             let g = rule.lateral_gap_mm + c;
             let walls = place.holds_sides();
-            let mut side = vec![[0i64; 4]; n];
+            let mut wall = vec![[0i64; 4]; n];
+            let mut touch: Vec<Vec<(usize, u8, i64)>> = vec![Vec::new(); n];
             for (i, p) in items.iter().enumerate() {
                 let (fx, fy) = (p.depth as i64 * p.height as i64, p.width as i64 * p.height as i64);
                 if walls {
-                    if p.x <= g { side[i][0] = fx; }
-                    if p.x + p.width >= place.width - g { side[i][1] = fx; }
-                    if p.y <= g { side[i][2] = fy; }
-                    if p.y + p.depth >= place.depth - g { side[i][3] = fy; }
+                    let gaps = [p.x, place.width - (p.x + p.width), p.y, place.depth - (p.y + p.depth)];
+                    let face = [fx, fx, fy, fy];
+                    for k in 0..4 {
+                        if crate::bin_state::lean_gap_ok(gaps[k] - c, p.height) {
+                            wall[i][k] = face[k];
+                        }
+                    }
                 }
             }
             for a in 0..n {
@@ -183,24 +189,24 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                     if oz == 0 {
                         continue;
                     }
-                    let (ia, ib2) = (order[a], ib);
+                    let ia = order[a];
                     let oy = overlap(pa.y, pa.y + pa.depth, pb.y, pb.y + pb.depth);
                     let ox = overlap(pa.x, pa.x + pa.width, pb.x, pb.x + pb.width);
+                    let mut link = |fa: u8, fb: u8, area: i64| {
+                        touch[ia].push((ib, fa, area));
+                        touch[ib].push((ia, fb, area));
+                    };
                     if oy > 0 && (0..=g).contains(&(pb.x - (pa.x + pa.width))) {
-                        side[ia][1] += oy * oz;
-                        side[ib2][0] += oy * oz;
+                        link(1, 0, oy * oz);
                     }
                     if oy > 0 && (0..=g).contains(&(pa.x - (pb.x + pb.width))) {
-                        side[ia][0] += oy * oz;
-                        side[ib2][1] += oy * oz;
+                        link(0, 1, oy * oz);
                     }
                     if ox > 0 && (0..=g).contains(&(pb.y - (pa.y + pa.depth))) {
-                        side[ia][3] += ox * oz;
-                        side[ib2][2] += ox * oz;
+                        link(3, 2, ox * oz);
                     }
                     if ox > 0 && (0..=g).contains(&(pa.y - (pb.y + pb.depth))) {
-                        side[ia][2] += ox * oz;
-                        side[ib2][3] += ox * oz;
+                        link(2, 3, ox * oz);
                     }
                 }
             }
@@ -212,26 +218,55 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                 .iter()
                 .enumerate()
                 .map(|(i, p)| crate::bin_state::TipBox {
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                    mass: p.weight,
                     w: p.width,
                     d: p.depth,
                     h: p.height,
-                    side: side[i],
+                    wall: wall[i],
+                    touch: &touch[i],
                     supports: &supports[i],
+                    lever: levers[i],
                     tied: tied[i],
                 })
                 .collect();
             let mut up: Vec<usize> = (0..n).collect();
             up.sort_by_key(|&i| items[i].z);
-            let margin = crate::bin_state::final_tip_margins(&boxes, &up, acc, rule);
+            let st = crate::bin_state::stack_check(&boxes, &up, acc, rule);
+            if let Ok(dbg) = std::env::var("PUCKER_DEBUG_ITEM") {
+                // Developer aid: why an item passed or failed the stability check.
+                for (i, p) in items.iter().enumerate() {
+                    if dbg.split(',').any(|d| d == p.item_id) {
+                        let l = st.loads[i];
+                        let m = l[0].max(1e-9);
+                        eprintln!(
+                            "{} at {:?} size {:?}: riding {:.2} kg at ({:.0}, {:.0}, {:.0}), pressing {:.2} kg, lever {:?}, held {:?}, reserve {:?}, slack {:?}",
+                            p.item_id, (p.x, p.y, p.z), (p.width, p.depth, p.height), l[0],
+                            l[1] / m, l[2] / m, l[3] / m, l[4], levers[i], st.pinned[i], st.reserve[i], st.slack[i]
+                        );
+                    }
+                }
+            }
+            let margin = st.reserve;
             for &i in &up {
                 let p = &items[i];
                 if let Some(a) = (0..4).find(|&a| margin[i][a] < -EPS) {
-                    let own = crate::bin_state::own_margins(p.width, p.depth, p.height, acc);
+                    let own = crate::bin_state::own_margins(levers[i], p.height, acc);
                     let dir = ["влево (−X)", "вправо (+X)", "вперёд (−Y)", "назад (+Y)"][a];
+                    if st.slides[i][a] {
+                        let nom = crate::bin_state::nominal(acc, rule)[a];
+                        push("SLIDE", &bin.bin_id, &p.item_id, format!(
+                            "Сдвинется {} при {:.1} g: трения ({}) не хватает, а упереться не во что",
+                            dir, nom, rule.friction
+                        ));
+                        continue;
+                    }
                     let code = if own[a] < 0.0 { "STANDING_FREE" } else { "TOWER" };
                     push(code, &bin.bin_id, &p.item_id, format!(
-                        "Опрокинется {} при {:.1} g: не хватает {:.0} мм запаса, с этой стороны коробку ничего не держит",
-                        dir, acc[a], -margin[i][a]
+                        "Опрокинется {} при {:.2} g (с запасом ×{}) вместе со всем, что на ней стоит: центр тяжести выходит за край опоры на {:.0} мм",
+                        dir, acc[a], rule.tip_safety_factor, -margin[i][a]
                     ));
                 }
             }

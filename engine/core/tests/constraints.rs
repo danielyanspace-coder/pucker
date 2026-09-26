@@ -222,30 +222,27 @@ fn lone_tower_is_rejected_but_held_stack_is_fine() {
 }
 
 #[test]
-fn stretch_wrap_and_bonding_hold_stacks() {
+fn stretch_wrap_holds_only_outwards_and_overhangs_count() {
     let p = place(PackingPlaceType::Pallet, [800, 1200, 1800]);
+    // A tower on the edge of a wrapped pallet: the film stops it falling out, not in.
     let tower: Vec<Item> = (0..3).map(|i| item(&format!("t#{}", i), [250, 250, 300], 2.0, 5)).collect();
-    // On the edge of a wrapped pallet the film ties the stack; without wrap it tips.
-    let req = request(tower.clone(), p.clone());
-    let edge = |req: &PackingRequest| (0..3).map(|i| at(req, &format!("t#{}", i), 0, 500, 300 * i)).collect::<Vec<_>>();
-    assert!(codes(&req, edge(&req)).is_empty());
-    let mut bare = p.clone();
-    bare.stretch_wrapped = Some(false);
-    let req = request(tower, bare);
-    assert!(codes(&req, edge(&req)).contains(&"TOWER".to_string()));
+    let req = request(tower, p.clone());
+    let edge: Vec<PlacedItem> = (0..3).map(|i| at(&req, &format!("t#{}", i), 0, 500, 300 * i)).collect();
+    assert!(codes(&req, edge).contains(&"TOWER".to_string()));
 
-    // Two columns side by side in the middle, 600 mm on a 250 mm base: each can tip away
-    // from the other. A box bridging both ties them into one block.
-    let mut items: Vec<Item> = (0..4).map(|i| item(&format!("c#{}", i), [250, 500, 300], 3.0, 5)).collect();
-    items.push(item("bridge", [500, 500, 100], 3.0, 5));
+    // A base 250 mm deep with a wider box on top hanging 100 mm over one side and a load on
+    // it: together (14 kg, centre of gravity 181 mm up) they tip at 0.65 g over the edge of
+    // the base (97 mm away), although each box alone would stand. Centred (125 mm) it holds.
+    let items = vec![
+        item("base", [300, 250, 200], 8.0, 9),
+        item("cap", [300, 350, 30], 1.0, 9),
+        item("load", [250, 300, 150], 5.0, 9),
+    ];
     let req = request(items, p);
-    let cols = |req: &PackingRequest| {
-        vec![at(req, "c#0", 300, 400, 0), at(req, "c#1", 300, 400, 300), at(req, "c#2", 550, 400, 0), at(req, "c#3", 550, 400, 300)]
-    };
-    assert!(codes(&req, cols(&req)).contains(&"TOWER".to_string()));
-    let mut bonded = cols(&req);
-    bonded.push(at(&req, "bridge", 300, 400, 600));
-    let got = codes(&req, bonded);
+    let mushroom = vec![at(&req, "base", 250, 500, 0), at(&req, "cap", 250, 500, 200), at(&req, "load", 275, 545, 230)];
+    assert!(codes(&req, mushroom).contains(&"TOWER".to_string()));
+    let centred = vec![at(&req, "base", 250, 500, 0), at(&req, "cap", 250, 450, 200), at(&req, "load", 275, 475, 230)];
+    let got = codes(&req, centred);
     assert!(got.is_empty(), "{:?}", got);
 }
 
@@ -257,13 +254,13 @@ fn standing_on_edge_needs_neighbours_on_both_sides() {
         let mut v = vec![item("thin", [100, 400, 300], 3.0, 5)];
         if extra {
             v.push(item("l", [300, 400, 300], 5.0, 5));
-            v.push(item("r", [300, 400, 300], 5.0, 5));
+            v.push(item("r", [400, 400, 300], 5.0, 5));
         }
         request(v, p.clone())
     };
     let req = mk(false);
     assert!(codes(&req, vec![at(&req, "thin", 300, 300, 0)]).contains(&"STANDING_FREE".to_string()));
-    // Squeezed between two boxes it is fine.
+    // Squeezed between two boxes that reach the sides of the pallet it is fine.
     let req = mk(true);
     assert!(codes(&req, vec![at(&req, "l", 0, 300, 0), at(&req, "thin", 300, 300, 0), at(&req, "r", 400, 300, 0)]).is_empty());
     // Taller than 3× its thin side is never allowed.

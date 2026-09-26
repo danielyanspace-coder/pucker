@@ -4,15 +4,15 @@
 //! top it overlaps, so there are never collisions from below or above. Every hard constraint
 //! is checked before a box is committed (ТЗ §32, stage 4).
 
-use crate::geometry::{hull_of_rects, overlap, strictly_inside_doubled, union_area, Rect};
+use crate::geometry::{hull_of_rects, overlap, strictly_inside_doubled, support_levers, union_area, Rect};
 use crate::model::{PackRule, PackingPlace};
 use crate::prep::PrepItem;
 
 const EPS: f64 = 1e-9;
 /// Side gaps narrower than this are unlikely to be filled later.
 const NARROW_GAP: i32 = 120;
-/// Tipping reserve (mm) that counts as plenty when scoring positions.
-const RESERVE_MM: f64 = 600.0;
+/// Tipping reserve (mm of lever) that counts as plenty when scoring positions.
+const RESERVE_MM: f64 = 100.0;
 const SIDE_NEG_X: usize = 0;
 const SIDE_POS_X: usize = 1;
 const SIDE_NEG_Y: usize = 2;
@@ -34,15 +34,44 @@ pub struct Placed {
     pub received: f64,
     /// Side contact area with neighbours or walls: -x, +x, -y, +y.
     pub side_contact: [i64; 4],
-    /// Tipping reserve (mm) per direction (−x, +x, −y, +y) of the stack this box tops:
-    /// how much taller it could be before tipping at the transport acceleration.
-    /// Infinite in a direction where the box leans on a neighbour or wall.
+    /// Contact area with walls (or stretch wrap) per face.
+    pub wall: [i64; 4],
+    /// Neighbours touching a face: (placed index, face of this box, area).
+    pub touch: Vec<(usize, u8, i64)>,
+    /// Tipping reserve (mm) per direction (−x, +x, −y, +y) of this box with everything
+    /// resting on it (`stack_check`). Infinite where it is held.
     pub margin: [f64; 4],
+    /// Distance from the centre to the edge of the support, per direction (`support_levers`).
+    pub lever: [f64; 4],
+    pub mass: f64,
+    /// Loads on the box (`Loads`, `stack_check`).
+    pub loads: Loads,
+    /// Held against tipping per direction (`stack_check`).
+    pub pinned: [bool; 4],
+    /// Push (kg) and moment (kg·mm) it can still take from boxes leaning on it (`Stacks::slack`).
+    pub slack: [[f64; 2]; 4],
 }
 
 impl Placed {
     fn top(&self) -> i32 {
         self.z + self.h
+    }
+
+    fn tip_box<'b>(&'b self, supports: &'b [(usize, i64)]) -> TipBox<'b> {
+        TipBox {
+            x: self.x,
+            y: self.y,
+            z: self.z,
+            w: self.w,
+            d: self.d,
+            h: self.h,
+            mass: self.mass,
+            wall: self.wall,
+            touch: &self.touch,
+            supports,
+            lever: self.lever,
+            tied: [false; 4],
+        }
     }
 }
 
@@ -118,6 +147,7 @@ pub struct Candidate {
     pub score: f64,
 }
 
+#[derive(Clone)]
 pub struct BinState<'a> {
     pub place: &'a PackingPlace,
     pub place_index: usize,
@@ -322,6 +352,7 @@ impl<'a> BinState<'a> {
             }
         }
         let support = union_area(&self.rects);
+        let lever = if support >= foot_area { full_levers(w, d) } else { support_levers(&self.rects, x as f64 + w as f64 / 2.0, y as f64 + d as f64 / 2.0) };
         if (support as f64) < self.rule.required_support(w, d, h) * foot_area as f64 - EPS {
             return Err(Reject::Support);
         }
@@ -350,16 +381,15 @@ impl<'a> BinState<'a> {
 
         // Neighbours around the box: bracing (docs/DECISIONS.md §4) and scoring.
         let sup = std::mem::take(&mut self.sup);
-        let (side, flush) = self.side_contacts(x, y, z, w, d, h, false);
+        let (side, anch, touch, flush) = self.side_contacts(x, y, z, w, d, h, false);
         let result = (|| {
             // Tipping reserve left for boxes that will stand on this one, 0..1.
             let mut reserve = 1.0;
             if self.rule.use_lateral_stability {
-                let m = self.tip_margins(&sup, &side, x, y, w, d, h);
-                if m.iter().any(|&v| v < -EPS) {
-                    return Err(Reject::Lateral);
+                match self.tip_check(&sup, &anch, &touch, lever, x, y, z, w, d, h, it.weight) {
+                    Some(r) => reserve = r.min(RESERVE_MM) / RESERVE_MM,
+                    None => return Err(Reject::Lateral),
                 }
-                reserve = m.iter().fold(f64::INFINITY, |a, &v| a.min(v)).min(RESERVE_MM) / RESERVE_MM;
             }
             // For scoring, the pallet edges act like walls: aligning to them is good.
             let mut side_score = side;
@@ -454,24 +484,32 @@ impl<'a> BinState<'a> {
     /// is flush with some touching neighbour's top.
     /// `fresh_query = false` reuses the neighbours found by the last `drop_z`.
     #[allow(clippy::too_many_arguments)]
-    fn side_contacts(&mut self, x: i32, y: i32, z: i32, w: i32, d: i32, h: i32, fresh_query: bool) -> ([i64; 4], f64) {
+    /// Contact with walls (or stretch wrap) per face.
+    fn wall_contact(&self, x: i32, y: i32, w: i32, d: i32, h: i32) -> [i64; 4] {
         let p = self.place;
-        let g = self.rule.lateral_gap_mm + self.rule.clearance_mm;
         let mut s = [0i64; 4];
         if self.walls {
-            if x <= g {
-                s[SIDE_NEG_X] = d as i64 * h as i64;
-            }
-            if x + w >= p.width - g {
-                s[SIDE_POS_X] = d as i64 * h as i64;
-            }
-            if y <= g {
-                s[SIDE_NEG_Y] = w as i64 * h as i64;
-            }
-            if y + d >= p.depth - g {
-                s[SIDE_POS_Y] = w as i64 * h as i64;
+            let gaps = [x, p.width - (x + w), y, p.depth - (y + d)];
+            let face = [d, d, w, w];
+            for k in 0..4 {
+                if lean_gap_ok(gaps[k] - self.rule.clearance_mm, h) {
+                    s[k] = face[k] as i64 * h as i64;
+                }
             }
         }
+        s
+    }
+
+    /// Side contacts of a box at this position: total per face (walls and neighbours), the part
+    /// that holds it (walls and neighbours that are themselves held that way), the touching
+    /// neighbours (index, face, area) and how flush its top is with theirs.
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
+    fn side_contacts(&mut self, x: i32, y: i32, z: i32, w: i32, d: i32, h: i32, fresh_query: bool) -> ([i64; 4], [i64; 4], Vec<(usize, u8, i64)>, f64) {
+        let g = self.rule.lateral_gap_mm + self.rule.clearance_mm;
+        let mut s = self.wall_contact(x, y, w, d, h);
+        let mut anch = s;
+        let mut touch = Vec::new();
         let mut flush = 0.0f64;
         if fresh_query {
             self.query(x - g, y - g, x + w + g, y + d + g);
@@ -484,28 +522,35 @@ impl<'a> BinState<'a> {
             }
             let oy = overlap(y, y + d, b.y, b.y + b.d);
             let ox = overlap(x, x + w, b.x, b.x + b.w);
-            let mut touch = false;
+            let mut faces: [i64; 4] = [0; 4];
             if oy > 0 {
                 if (0..=g).contains(&(x - (b.x + b.w))) {
-                    s[SIDE_NEG_X] += oy * oz;
-                    touch = true;
+                    faces[SIDE_NEG_X] = oy * oz;
                 }
                 if (0..=g).contains(&(b.x - (x + w))) {
-                    s[SIDE_POS_X] += oy * oz;
-                    touch = true;
+                    faces[SIDE_POS_X] = oy * oz;
                 }
             }
             if ox > 0 {
                 if (0..=g).contains(&(y - (b.y + b.d))) {
-                    s[SIDE_NEG_Y] += ox * oz;
-                    touch = true;
+                    faces[SIDE_NEG_Y] = ox * oz;
                 }
                 if (0..=g).contains(&(b.y - (y + d))) {
-                    s[SIDE_POS_Y] += ox * oz;
-                    touch = true;
+                    faces[SIDE_POS_Y] = ox * oz;
                 }
             }
-            if touch {
+            let gaps = [x - (b.x + b.w), b.x - (x + w), y - (b.y + b.d), b.y - (y + d)];
+            let reach = (z + h).min(b.top()) - z;
+            for k in 0..4 {
+                if faces[k] > 0 {
+                    s[k] += faces[k];
+                    if b.pinned[k] && lean_gap_ok(gaps[k].max(0), reach) {
+                        anch[k] += faces[k];
+                    }
+                    touch.push((j, k as u8, faces[k]));
+                }
+            }
+            if faces.iter().any(|&f| f > 0) {
                 let diff = (b.top() - (z + h)).abs();
                 if diff <= 5 {
                     flush = 1.0;
@@ -514,56 +559,127 @@ impl<'a> BinState<'a> {
                 }
             }
         }
-        (s, flush)
+        (s, anch, touch, flush)
     }
 
-    /// Tipping reserve in each of the four directions (docs/DECISIONS.md §4): unless the box
-    /// leans on a neighbour or wall on that side, the box and every free level below must
-    /// stay upright at that direction's transport acceleration. A box resting on a firm
-    /// support ties the other stacks under it (bonding), as in `final_tip_margins`.
+    /// Can the box go here without tipping over or toppling anything under it? The box with
+    /// everything already on its supports must keep the line of gravity plus transport force
+    /// inside each support (`stack_check`). Returns the smallest reserve (mm), or None.
     #[allow(clippy::too_many_arguments)]
-    fn tip_margins(&self, supports: &[(usize, i64)], side: &[i64; 4], x: i32, y: i32, w: i32, d: i32, h: i32) -> [f64; 4] {
-        if self.tied(x, y, w, d) {
-            return [f64::INFINITY; 4];
-        }
-        let own = own_margins(w, d, h, self.acc);
-        let held = held_dirs(side, w, d, h, own, self.rule);
-        let foot = w as i64 * d as i64;
-        let mut m = [f64::INFINITY; 4];
-        for a in 0..4 {
-            if held[a] {
-                continue;
+    fn tip_check(&self, sup: &[(usize, i64)], anch: &[i64; 4], touch: &[(usize, u8, i64)], lever: [f64; 4], x: i32, y: i32, z: i32, w: i32, d: i32, h: i32, mass: f64) -> Option<f64> {
+        let wall = self.wall_contact(x, y, w, d, h);
+        let cand = TipBox { x, y, z, w, d, h, mass, wall, touch, supports: sup, lever, tied: [false; 4] };
+        let own = own_margins(lever, h, self.acc);
+        let held = held_dirs(anch, w, d, h, own, self.rule);
+        let add = own_loads(&cand);
+        let mut worst = f64::INFINITY;
+        let acc_nom = nominal(self.acc, self.rule);
+        let mu = self.rule.friction;
+        for k in 0..4 {
+            if !held[k] {
+                let bal = balance(&cand, &add, self.acc[k], k);
+                let slide = (acc_nom[k] - mu) * mass;
+                if (bal < -EPS || slide > EPS) && !self.can_lean(&cand, k, -bal, slide, own[k]) {
+                    return None;
+                }
+                worst = worst.min((bal / mass.max(1e-9)).max(0.0));
             }
-            m[a] = supports.iter().fold(own[a], |acc, &(j, area)| {
-                let b = &self.placed[j];
-                let bridged = area * 5 >= foot.min(b.w as i64 * b.d as i64)
-                    && supports.iter().any(|&(k, ka)| k != j && ka * 4 >= foot && self.placed[k].margin[a] >= -EPS);
-                if bridged { acc } else { acc.min(b.margin[a] - h as f64) }
-            });
         }
-        m
+        // Push the new weight down: every box under it now carries a share, riding with it or
+        // pressing on it (`add_loads`).
+        let foot = w as i64 * d as i64;
+        let mut down: std::collections::BTreeMap<usize, (Loads, [bool; 4])> = Default::default();
+        let total: i64 = sup.iter().map(|s| s.1).sum::<i64>().max(1);
+        for &(j, a) in sup {
+            let q = &self.placed[j];
+            let fj = q.w as i64 * q.d as i64;
+            let e = down.entry(j).or_insert(([0.0; 8], [false; 4]));
+            add_loads(&mut e.0, &add, a as f64 / total as f64, &cand, &q.tip_box(&q.supports));
+            let p = pins(a, foot, fj);
+            for (e1, h1) in e.1.iter_mut().zip(held) {
+                *e1 |= h1 && p;
+            }
+        }
+        while let Some((j, (delta, pin))) = down.pop_last() {
+            let p = &self.placed[j];
+            let tb = p.tip_box(&p.supports);
+            let new: Loads = std::array::from_fn(|q| p.loads[q] + delta[q]);
+            for k in 0..4 {
+                if p.pinned[k] || pin[k] {
+                    continue;
+                }
+                // Change of its moment balance; what it had to spare covers it first.
+                let bal = balance(&tb, &new, self.acc[k], k);
+                let left = p.slack[k][1] + (bal - balance(&tb, &p.loads, self.acc[k], k));
+                let left_f = p.slack[k][0] + (mu - acc_nom[k]) * weight_of(&delta);
+                if left < -EPS || left_f < -EPS {
+                    let own = own_margins(p.lever, p.h, self.acc)[k];
+                    if !self.can_lean(&tb, k, -left, -left_f, own) {
+                        return None;
+                    }
+                }
+                worst = worst.min((bal / weight_of(&new).max(1e-9)).max(0.0));
+            }
+            let tot: i64 = p.supports.iter().map(|s| s.1).sum::<i64>().max(1);
+            let fp = p.w as i64 * p.d as i64;
+            for &(s2, a) in &p.supports {
+                let q = &self.placed[s2];
+                let fs = q.w as i64 * q.d as i64;
+                let e = down.entry(s2).or_insert(([0.0; 8], [false; 4]));
+                add_loads(&mut e.0, &delta, a as f64 / tot as f64, &tb, &q.tip_box(&q.supports));
+                let ps = pins(a, fp, fs);
+                for (e1, p1) in e.1.iter_mut().zip(pin) {
+                    *e1 |= p1 && ps;
+                }
+            }
+        }
+        Some(worst)
     }
 
-    /// Recompute every box's tipping reserve after a change (new contacts, new bonds).
+    /// Can box `b` pass a tipping deficit (kg·mm) and a sliding excess (kg) to what it touches
+    /// on side `k`? Walls and held boxes take anything, others what they have left
+    /// (`Stacks::slack`); one step only, the final check follows whole rows.
+    fn can_lean(&self, b: &TipBox, k: usize, moment: f64, force: f64, own: f64) -> bool {
+        let holding: Vec<(usize, i64)> = b
+            .touch
+            .iter()
+            .filter(|t| {
+                let q = &self.placed[t.0];
+                let (g, r) = gap_reach(b, &q.tip_box(&q.supports), k);
+                t.1 as usize == k && lean_gap_ok(g, r)
+            })
+            .map(|t| (t.0, t.2))
+            .collect();
+        let contact = b.wall[k] + holding.iter().map(|t| t.1).sum::<i64>();
+        if !lean_contact_ok(b, k, contact, own, self.rule) {
+            return false;
+        }
+        holding.iter().all(|&(j, a)| {
+            let q = &self.placed[j];
+            if q.pinned[k] {
+                return true;
+            }
+            let qb = q.tip_box(&q.supports);
+            let zc = contact_mid(b, &qb);
+            let f = a as f64 / contact as f64 * force.max(moment / (zc - b.z as f64).max(1.0)).max(0.0);
+            q.slack[k][0] >= f - EPS && q.slack[k][1] >= f * (zc - q.z as f64).max(1.0) - EPS
+        })
+    }
+
+    /// Recompute bodies, holds and reserves after a change (new box, new contacts).
     fn refresh_margins(&mut self) {
         let n = self.placed.len();
-        let boxes: Vec<TipBox> = self
-            .placed
-            .iter()
-            .map(|p| TipBox { w: p.w, d: p.d, h: p.h, side: p.side_contact, supports: &p.supports, tied: [self.tied(p.x, p.y, p.w, p.d); 4] })
-            .collect();
-        let order: Vec<usize> = (0..n).collect();
-        let margin = final_tip_margins(&boxes, &order, self.acc, self.rule);
-        drop(boxes);
-        for (p, m) in self.placed.iter_mut().zip(margin) {
-            p.margin = m;
+        let st = {
+            let boxes: Vec<TipBox> = self.placed.iter().map(|p| p.tip_box(&p.supports)).collect();
+            let order: Vec<usize> = (0..n).collect();
+            stack_check(&boxes, &order, self.acc, self.rule)
+        };
+        for (i, p) in self.placed.iter_mut().enumerate() {
+            p.margin = st.reserve[i];
+            p.loads = st.loads[i];
+            p.pinned = st.pinned[i];
+            p.slack = st.slack[i];
         }
-    }
-
-    /// On the perimeter of a stretch-wrapped pallet (touching the film).
-    fn tied(&self, x: i32, y: i32, w: i32, d: i32) -> bool {
-        let g = self.rule.lateral_gap_mm + self.rule.clearance_mm;
-        self.place.wrap_ties() && (x <= g || y <= g || x + w >= self.place.width - g || y + d >= self.place.depth - g)
     }
 
     /// Final tipping check of the finished load (docs/DECISIONS.md §4), including the load
@@ -583,11 +699,11 @@ impl<'a> BinState<'a> {
                 .placed
                 .iter()
                 .zip(tied)
-                .map(|(p, t)| TipBox { w: p.w, d: p.d, h: p.h, side: p.side_contact, supports: &p.supports, tied: t })
+                .map(|(p, t)| TipBox { tied: t, ..p.tip_box(&p.supports) })
                 .collect();
             // Supports are always placed earlier, so index order is bottom-up.
             let order: Vec<usize> = (0..n).collect();
-            let margin = final_tip_margins(&boxes, &order, self.acc, self.rule);
+            let margin = stack_check(&boxes, &order, self.acc, self.rule).reserve;
             drop(boxes);
             let mut drop = vec![false; n];
             for i in 0..n {
@@ -853,9 +969,13 @@ impl<'a> BinState<'a> {
         }
         let support_area = union_area(&rects);
 
-        let (side, _) = self.side_contacts(x, y, z, w, d, h, true);
+        let (side, _, touch, _) = self.side_contacts(x, y, z, w, d, h, true);
+        let wall = self.wall_contact(x, y, w, d, h);
+        let new_index = self.placed.len();
         let neighbours: Vec<usize> = self.buf.clone();
-        let margin = self.tip_margins(&supports, &side, x, y, w, d, h);
+        let lever = box_levers(&rects, x, y, w, d);
+        let m = it.weight;
+        let loads = [m, m * (x as f64 + w as f64 / 2.0), m * (y as f64 + d as f64 / 2.0), m * (z as f64 + h as f64 / 2.0), 0.0, 0.0, 0.0, 0.0];
 
         // Push the load down.
         let mut pending: Vec<(usize, f64)> = Vec::new();
@@ -892,15 +1012,16 @@ impl<'a> BinState<'a> {
                 add[SIDE_NEG_Y] += ox * oz;
             }
             if add.iter().any(|&a| a > 0) {
-                let mut s = b.side_contact;
-                for k in 0..4 {
-                    s[k] += add[k];
+                let b = &mut self.placed[j];
+                for (k, &a) in add.iter().enumerate() {
+                    b.side_contact[k] += a;
+                    if a > 0 {
+                        b.touch.push((new_index, k as u8, a));
+                    }
                 }
-                self.placed[j].side_contact = s;
             }
         }
 
-        let new_index = self.placed.len();
         self.placed.push(Placed {
             item: idx,
             orient: cand.orient,
@@ -914,7 +1035,14 @@ impl<'a> BinState<'a> {
             support_area,
             received: 0.0,
             side_contact: side,
-            margin,
+            wall,
+            touch,
+            margin: [f64::INFINITY; 4],
+            lever,
+            mass: m,
+            loads,
+            pinned: [false; 4],
+            slack: [[f64::INFINITY; 2]; 4],
         });
         self.stamp.push(0);
         if self.rule.use_lateral_stability {
@@ -1008,20 +1136,36 @@ impl<'a> BinState<'a> {
 /// forwards when braking. In vehicles and containers the front wall is at y = 0 (loading
 /// starts there, doors at the far end), so braking throws the cargo towards −y. A pallet
 /// may be loaded either way round, so it gets 0.5 g in every direction (EUMOS 40509).
+/// All are multiplied by `tip_safety_factor`.
 pub fn tip_accels(place: &crate::model::PackingPlace, rule: &PackRule) -> [f64; 4] {
-    let lat = rule.accel_lateral_g.max(0.01);
+    let k = rule.tip_safety_factor.max(1.0);
+    let lat = rule.accel_lateral_g.max(0.01) * k;
     if place.place_type == crate::model::PackingPlaceType::Pallet {
         [lat; 4]
     } else {
-        [lat, lat, rule.accel_longitudinal_g.max(lat), lat]
+        [lat, lat, (rule.accel_longitudinal_g * k).max(lat), lat]
     }
 }
 
 /// Reserve (mm) of a free-standing box against tipping in each direction: a uniform box tips
-/// when a·h/2 > b/2, so it stays upright while h ≤ b / a.
-pub fn own_margins(w: i32, d: i32, h: i32, acc: [f64; 4]) -> [f64; 4] {
-    let (w, d, h) = (w as f64, d as f64, h as f64);
-    [w / acc[0] - h, w / acc[1] - h, d / acc[2] - h, d / acc[3] - h]
+/// when a·h/2 exceeds the lever to the edge of its support, so it stays upright while
+/// h ≤ 2·lever / a. Standing fully on something, the lever is half its base.
+pub fn own_margins(lever: [f64; 4], h: i32, acc: [f64; 4]) -> [f64; 4] {
+    std::array::from_fn(|k| 2.0 * lever[k] / acc[k] - h as f64)
+}
+
+/// Levers of a box whose whole base is supported.
+pub fn full_levers(w: i32, d: i32) -> [f64; 4] {
+    let (hw, hd) = (w as f64 / 2.0, d as f64 / 2.0);
+    [hw, hw, hd, hd]
+}
+
+/// Levers of a box at (x, y) of size w × d standing on `rects` (parts of its footprint).
+pub fn box_levers(rects: &[Rect], x: i32, y: i32, w: i32, d: i32) -> [f64; 4] {
+    if union_area(rects) >= w as i64 * d as i64 {
+        return full_levers(w, d);
+    }
+    support_levers(rects, x as f64 + w as f64 / 2.0, y as f64 + d as f64 / 2.0)
 }
 
 /// Is the box blocked from tipping in each direction, i.e. does it lean on a neighbour, wall
@@ -1037,32 +1181,32 @@ pub fn held_dirs(side: &[i64; 4], w: i32, d: i32, h: i32, own: [f64; 4], rule: &
     held
 }
 
-/// One box for the final tipping check: size, side contacts (−x, +x, −y, +y) and the boxes
-/// it rests on with contact areas.
+/// One box for the tipping check: position, size, mass, walls and neighbours at its sides,
+/// the boxes it rests on with contact areas and its levers (`support_levers`).
+#[derive(Clone)]
 pub struct TipBox<'b> {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
     pub w: i32,
     pub d: i32,
     pub h: i32,
-    pub side: [i64; 4],
+    pub mass: f64,
+    /// Contact with walls (or stretch wrap) per face.
+    pub wall: [i64; 4],
+    /// Touching neighbours: (index, face of this box, area).
+    pub touch: &'b [(usize, u8, i64)],
     pub supports: &'b [(usize, i64)],
-    /// Directions held by securing rather than by neighbours: the stretch wrap for boxes on
-    /// the perimeter of a pallet (every way), a strap or load bar across the rear face of
-    /// the load in a vehicle (+y).
+    pub lever: [f64; 4],
+    /// Directions held by securing rather than by neighbours: a strap or load bar across
+    /// the rear face of the load in a vehicle (+y). Stretch wrap on a pallet only keeps
+    /// boxes from falling outwards (it acts as a wall); it does not stop a box tipping
+    /// inwards into a gap.
     pub tied: [bool; 4],
 }
 
 /// Directions each box ([x, y, z, w, d, h]) is held in by load securing (see `TipBox::tied`).
 pub fn tied_dirs(place: &crate::model::PackingPlace, rule: &PackRule, boxes: &[[i32; 6]]) -> Vec<[bool; 4]> {
-    let g = rule.lateral_gap_mm + rule.clearance_mm;
-    if place.wrap_ties() {
-        return boxes
-            .iter()
-            .map(|&[x, y, _, w, d, _]| {
-                let t = x <= g || y <= g || x + w >= place.width - g || y + d >= place.depth - g;
-                [t; 4]
-            })
-            .collect();
-    }
     if !place.has_walls() || !rule.secure_rear_face {
         return vec![[false; 4]; boxes.len()];
     }
@@ -1078,20 +1222,150 @@ pub fn tied_dirs(place: &crate::model::PackingPlace, rule: &PackRule, boxes: &[[
         .collect()
 }
 
-/// Tipping reserve per box and direction in the finished load (docs/DECISIONS.md §4);
-/// negative = the box (with the stack under it) tips at the transport acceleration.
-/// `order` lists the boxes bottom-up. A box is held in a direction when
-/// - it is tied by securing (`TipBox::tied`), or
-/// - it leans on a neighbour or wall on that side (`held_dirs`), or
-/// - a box resting on it cannot move that way: that box is itself held, or also rests on
-///   another box that stands firm (bonding, «перевязка»: the bridge ties the stacks and
-///   friction under it keeps the top of this stack in place); held tops pass this down
-///   the column.
-///
-/// Everything else must stand on its own: the box and every free level under it.
-/// Holding is only derived from boxes already known to be firm, so boxes never hold
-/// each other up in a circle.
-pub fn final_tip_margins(boxes: &[TipBox], order: &[usize], acc: [f64; 4], rule: &PackRule) -> Vec<[f64; 4]> {
+/// Loads on a box for the tipping check. What rides with it as one body: the box itself and
+/// boxes standing mostly on it (`RIDE`): mass M and moments M·x, M·y, M·z. And what only
+/// presses on it from boxes bonded over it and other boxes: weight N at the contact
+/// (N·x, N·y), whose inertia pushes at its top (N·z). A free column tips as one body; a box
+/// under a bonded layer carries the layer's weight but does not tip it over with itself.
+pub type Loads = [f64; 8];
+
+/// Share of its support a box must have on one box to ride with it.
+const RIDE: f64 = 0.8;
+
+/// Loads of a box alone, uniform density.
+pub fn own_loads(b: &TipBox) -> Loads {
+    let m = b.mass.max(1e-6);
+    [m, m * (b.x as f64 + b.w as f64 / 2.0), m * (b.y as f64 + b.d as f64 / 2.0), m * (b.z as f64 + b.h as f64 / 2.0), 0.0, 0.0, 0.0, 0.0]
+}
+
+/// Total weight carried (kg).
+fn weight_of(l: &Loads) -> f64 {
+    l[0] + l[4]
+}
+
+/// Add the loads `l` of box `upper` (a `share` of it rests on `lower`) to `acc`.
+fn add_loads(acc: &mut Loads, l: &Loads, share: f64, upper: &TipBox, lower: &TipBox) {
+    if share >= RIDE {
+        for q in 0..8 {
+            acc[q] += share * l[q];
+        }
+    } else {
+        let n = share * weight_of(l);
+        let x0 = upper.x.max(lower.x) as f64;
+        let x1 = (upper.x + upper.w).min(lower.x + lower.w) as f64;
+        let y0 = upper.y.max(lower.y) as f64;
+        let y1 = (upper.y + upper.d).min(lower.y + lower.d) as f64;
+        acc[4] += n;
+        acc[5] += n * (x0 + x1) / 2.0;
+        acc[6] += n * (y0 + y1) / 2.0;
+        acc[7] += n * (lower.z + lower.h) as f64;
+    }
+}
+
+/// Moment balance (kg·mm) of box `b` with loads `l` against tipping in direction `k` at
+/// acceleration `a`: weight times the distance to the edge of the support, minus inertia
+/// times its height over the support. Negative = it tips.
+pub fn balance(b: &TipBox, l: &Loads, a: f64, k: usize) -> f64 {
+    let cx = b.x as f64 + b.w as f64 / 2.0;
+    let cy = b.y as f64 + b.d as f64 / 2.0;
+    let dist = |px: f64, py: f64| match k {
+        0 => px - (cx - b.lever[0]),
+        1 => cx + b.lever[1] - px,
+        2 => py - (cy - b.lever[2]),
+        _ => cy + b.lever[3] - py,
+    };
+    let mut bal = 0.0;
+    for (m, o) in [(l[0], 1), (l[4], 5)] {
+        if m > 1e-9 {
+            let (px, py, pz) = (l[o] / m, l[o + 1] / m, l[o + 2] / m);
+            bal += m * (dist(px, py) - a * (pz - b.z as f64));
+        }
+    }
+    bal
+}
+
+/// Reserve (mm): the balance per kg carried.
+pub fn reserve_of(b: &TipBox, l: &Loads, a: f64, k: usize) -> f64 {
+    balance(b, l, a, k) / weight_of(l).max(1e-9)
+}
+
+/// A box resting on another with this much contact passes its hold down to it: if the upper
+/// box cannot move that way, friction under it keeps the lower one from tipping.
+fn pins(area: i64, foot_upper: i64, foot_lower: i64) -> bool {
+    area * 5 >= foot_upper.min(foot_lower)
+}
+
+/// Stability of a finished load (docs/DECISIONS.md §4). For every box and direction, the box
+/// with what rides on it and what presses on it (`Loads`) must not tip over the edge of its
+/// support (`balance`). A box is held in a
+/// direction, and then not checked, when it leans on a wall, securing or a neighbour that is
+/// itself held that way (a tight row up to the wall), or when a box resting on it is held
+/// that way. A neighbour that could itself fall over holds nothing. `order` lists the boxes
+/// bottom-up.
+pub struct Stacks {
+    pub pinned: Vec<[bool; 4]>,
+    pub loads: Vec<Loads>,
+    /// Reserve (mm) per direction, infinite where held (`reserve_of`); negative = tips.
+    /// A box that leans on neighbours able to carry it gets 0.
+    pub reserve: Vec<[f64; 4]>,
+    /// What the box can still take from boxes leaning on it, per direction, after what
+    /// already leans on it: push force (kg) before it slides, and moment (kg·mm) before it
+    /// tips. Infinite where held.
+    pub slack: Vec<[[f64; 2]; 4]>,
+    /// Fails by sliding (pushed or thrown harder than friction holds, nothing to lean on).
+    pub slides: Vec<[bool; 4]>,
+}
+
+/// Contact centre height of two touching boxes, for the lever of a push between them.
+fn contact_mid(a: &TipBox, b: &TipBox) -> f64 {
+    let lo = a.z.max(b.z) as f64;
+    let hi = (a.z + a.h).min(b.z + b.h) as f64;
+    (lo + hi) / 2.0
+}
+
+/// Largest tilt (rad) at which a box may still close a gap to what it leans on. A gap low
+/// down near the pivot takes a large tilt to close: the box topples over a low neighbour
+/// like over a kerb.
+const LEAN_TILT: f64 = 0.035;
+
+/// Does a gap of `gap` mm to a neighbour whose contact reaches `reach` mm above the box's
+/// bottom still hold it (closes within `LEAN_TILT`)?
+pub fn lean_gap_ok(gap: i32, reach: i32) -> bool {
+    gap as f64 <= 2.0 + LEAN_TILT * reach.max(0) as f64
+}
+
+/// Gap along face `k` of `a` to `b`, and how high above `a`'s bottom their contact reaches.
+fn gap_reach(a: &TipBox, b: &TipBox, k: usize) -> (i32, i32) {
+    let gap = match k {
+        0 => a.x - (b.x + b.w),
+        1 => b.x - (a.x + a.w),
+        2 => a.y - (b.y + b.d),
+        _ => b.y - (a.y + a.d),
+    };
+    (gap.max(0), (a.z + a.h).min(b.z + b.h) - a.z)
+}
+
+/// Touches on face `k` of box `i` that can hold it (`lean_gap_ok`).
+fn holding_touches<'a>(boxes: &'a [TipBox], i: usize, k: usize) -> impl Iterator<Item = (usize, i64)> + 'a {
+    boxes[i].touch.iter().filter(move |t| {
+        if t.1 as usize != k {
+            return false;
+        }
+        let (g, r) = gap_reach(&boxes[i], &boxes[t.0], k);
+        lean_gap_ok(g, r)
+    }).map(|t| (t.0, t.2))
+}
+
+/// Contact needed on a face to lean on it: half the face for a box that could not stand
+/// on its own, a fifth otherwise.
+fn lean_contact_ok(b: &TipBox, k: usize, contact: i64, own: f64, rule: &PackRule) -> bool {
+    let face = if k < 2 { b.d } else { b.w } as f64 * b.h as f64;
+    let ratio = if own < 0.0 { rule.standing_contact_ratio } else { rule.lateral_min_contact_ratio };
+    contact > 0 && contact as f64 >= face * ratio
+}
+
+pub fn stack_check(boxes: &[TipBox], order: &[usize], acc: [f64; 4], rule: &PackRule) -> Stacks {
+    let acc_nom = nominal(acc, rule);
     let n = boxes.len();
     let foot = |i: usize| boxes[i].w as i64 * boxes[i].d as i64;
     let mut above: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
@@ -1100,48 +1374,182 @@ pub fn final_tip_margins(boxes: &[TipBox], order: &[usize], acc: [f64; 4], rule:
             above[j].push((u, a));
         }
     }
-    let own: Vec<[f64; 4]> = boxes.iter().map(|b| own_margins(b.w, b.d, b.h, acc)).collect();
-    let mut fixed: Vec<[bool; 4]> = boxes
-        .iter()
-        .zip(&own)
-        .map(|(b, o)| {
-            let f = held_dirs(&b.side, b.w, b.d, b.h, *o, rule);
-            std::array::from_fn(|k| f[k] || b.tied[k])
-        })
-        .collect();
-    let mut margin = vec![[f64::INFINITY; 4]; n];
-    loop {
-        for &i in order {
-            let b = &boxes[i];
-            for a in 0..4 {
-                margin[i][a] = if fixed[i][a] {
-                    f64::INFINITY
-                } else {
-                    b.supports.iter().fold(own[i][a], |m, &(j, _)| m.min(margin[j][a] - b.h as f64))
-                };
-            }
+    let mut loads: Vec<Loads> = boxes.iter().map(own_loads).collect();
+    for &i in order.iter().rev() {
+        let mut acc = loads[i];
+        for &(u, a) in &above[i] {
+            let tot: i64 = boxes[u].supports.iter().map(|s| s.1).sum::<i64>().max(1);
+            add_loads(&mut acc, &loads[u], a as f64 / tot as f64, &boxes[u], &boxes[i]);
         }
+        loads[i] = acc;
+    }
+    // Held: grows from the walls inwards through tight contacts, and down from held boxes to
+    // what they stand on. Only from boxes already known to be held, never in a circle.
+    let own: Vec<[f64; 4]> = boxes.iter().map(|b| own_margins(b.lever, b.h, acc)).collect();
+    let mut pinned: Vec<[bool; 4]> = boxes.iter().map(|b| b.tied).collect();
+    loop {
         let mut changed = false;
         for i in 0..n {
-            for a in 0..4 {
-                if fixed[i][a] {
-                    continue;
+            let b = &boxes[i];
+            let mut anch = b.wall;
+            for k in 0..4 {
+                for (j, a) in holding_touches(boxes, i, k) {
+                    if pinned[j][k] {
+                        anch[k] += a;
+                    }
                 }
-                let tied = above[i].iter().any(|&(u, area)| {
-                    area * 5 >= foot(i).min(foot(u))
-                        && (fixed[u][a]
-                            || boxes[u].supports.iter().any(|&(k, ka)| k != i && ka * 4 >= foot(u) && margin[k][a] >= -EPS))
-                });
-                if tied {
-                    fixed[i][a] = true;
+            }
+            let held = held_dirs(&anch, b.w, b.d, b.h, own[i], rule);
+            for k in 0..4 {
+                if !pinned[i][k] && held[k] {
+                    pinned[i][k] = true;
+                    changed = true;
+                }
+            }
+        }
+        for &i in order.iter().rev() {
+            let from_above: [bool; 4] = std::array::from_fn(|k| above[i].iter().any(|&(u, a)| pinned[u][k] && pins(a, foot(u), foot(i))));
+            for (p, f) in pinned[i].iter_mut().zip(from_above) {
+                if !*p && f {
+                    *p = true;
                     changed = true;
                 }
             }
         }
         if !changed {
-            return margin;
+            break;
         }
     }
+    let mut reserve: Vec<[f64; 4]> = (0..n)
+        .map(|i| std::array::from_fn(|k| if pinned[i][k] { f64::INFINITY } else { reserve_of(&boxes[i], &loads[i], acc[k], k) }))
+        .collect();
+    // Leaning (CTU Code: rows leaning on each other load the front one) and bonding. A box
+    // that would tip, or is pushed harder than friction holds, needs the excess taken off:
+    // - by the neighbours it touches on that side (shared by contact area): walls and held
+    //   boxes take anything, others carry it from their own slack or pass it on;
+    // - failing that, by the boxes resting on it that also rest on other boxes (a bonded
+    //   layer, as bricks in a wall): friction under such a box on its other supports holds
+    //   the top of this one, up to (friction − acceleration) × the weight it puts there,
+    //   and those supports take the push at their top.
+    // Pushes go to boxes already handled too; those are handled again (bounded).
+    let mut slack = vec![[[f64::INFINITY; 2]; 4]; n];
+    let mut slides = vec![[false; 4]; n];
+    for k in 0..4 {
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by_key(|&i| {
+            let b = &boxes[i];
+            match k {
+                0 => -(b.x + b.w),
+                1 => b.x,
+                2 => -(b.y + b.d),
+                _ => b.y,
+            }
+        });
+        let mut push_f = vec![0.0f64; n];
+        let mut push_m = vec![0.0f64; n];
+        // Pushes each box has passed on: (target, force, moment), undone when handled again.
+        let mut passed: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); n];
+        let mut failed = vec![false; n];
+        let mut queue: std::collections::VecDeque<usize> = idx.iter().copied().collect();
+        let mut queued = vec![true; n];
+        let mut budget = 20 * n + 100;
+        while let Some(i) = queue.pop_front() {
+            queued[i] = false;
+            if pinned[i][k] {
+                continue;
+            }
+            if budget == 0 {
+                failed[i] = true;
+                continue;
+            }
+            budget -= 1;
+            for (j, f, m) in std::mem::take(&mut passed[i]) {
+                push_f[j] -= f;
+                push_m[j] -= m;
+            }
+            failed[i] = false;
+            let b = &boxes[i];
+            let mass = weight_of(&loads[i]);
+            let sf = (rule.friction - acc_nom[k]) * mass - push_f[i];
+            let sm = balance(&boxes[i], &loads[i], acc[k], k) - push_m[i];
+            if sf >= -EPS && sm >= -EPS {
+                continue;
+            }
+            let (ex_f, ex_m) = ((-sf).max(0.0), (-sm).max(0.0));
+            let mut out: Vec<(usize, f64, f64)> = Vec::new();
+            let contact = b.wall[k] + holding_touches(boxes, i, k).map(|t| t.1).sum::<i64>();
+            if lean_contact_ok(b, k, contact, own[i][k], rule) {
+                for (j, a) in holding_touches(boxes, i, k) {
+                    let share = a as f64 / contact as f64;
+                    let zc = contact_mid(b, &boxes[j]);
+                    let f = share * ex_f.max(ex_m / (zc - b.z as f64).max(1.0));
+                    out.push((j, f, f * (zc - boxes[j].z as f64).max(1.0)));
+                }
+            } else {
+                // Bonding from above.
+                let need = ex_f.max(ex_m / (b.h as f64).max(1.0));
+                let mut caps: Vec<(usize, f64)> = Vec::new();
+                for &(u, _) in &above[i] {
+                    let tot: i64 = boxes[u].supports.iter().map(|s| s.1).sum::<i64>().max(1);
+                    for &(k2, a2) in boxes[u].supports {
+                        if k2 == i || failed[k2] {
+                            continue;
+                        }
+                        let c = (rule.friction - acc_nom[k]).max(0.0) * weight_of(&loads[u]) * a2 as f64 / tot as f64;
+                        if c > 0.0 {
+                            caps.push((k2, c));
+                        }
+                    }
+                }
+                let cap: f64 = caps.iter().map(|c| c.1).sum();
+                if cap + EPS < need {
+                    failed[i] = true;
+                    continue;
+                }
+                for (k2, c) in caps {
+                    let f = need * c / cap;
+                    out.push((k2, f, f * boxes[k2].h as f64));
+                }
+            }
+            for &(j, f, m) in &out {
+                if pinned[j][k] {
+                    continue;
+                }
+                push_f[j] += f;
+                push_m[j] += m;
+                if !queued[j] {
+                    queued[j] = true;
+                    queue.push_back(j);
+                }
+            }
+            passed[i] = out.into_iter().filter(|o| !pinned[o.0][k]).collect();
+        }
+        for i in 0..n {
+            if pinned[i][k] {
+                continue;
+            }
+            let mass = weight_of(&loads[i]);
+            let sf = (rule.friction - acc_nom[k]) * mass - push_f[i];
+            let sm = balance(&boxes[i], &loads[i], acc[k], k) - push_m[i];
+            if failed[i] {
+                slides[i][k] = sm >= -EPS;
+                reserve[i][k] = reserve[i][k].min(-1.0);
+                slack[i][k] = [0.0, 0.0];
+            } else if sf >= -EPS && sm >= -EPS {
+                slack[i][k] = [sf, sm];
+            } else {
+                slack[i][k] = [0.0, 0.0];
+                reserve[i][k] = reserve[i][k].max(0.0);
+            }
+        }
+    }
+    Stacks { pinned, loads, reserve, slack, slides }
+}
+
+/// Transport accelerations without the tipping safety factor (for sliding).
+pub fn nominal(acc: [f64; 4], rule: &PackRule) -> [f64; 4] {
+    let k = rule.tip_safety_factor.max(1.0);
+    std::array::from_fn(|q| acc[q] / k)
 }
 
 /// Split `weight` between supports proportionally to contact area (ТЗ §9).

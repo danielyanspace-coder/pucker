@@ -48,6 +48,8 @@ enum Mode {
     Layers,
     /// Take the lowest free positions, put the best-fitting item there.
     Fill,
+    /// Full layers of one height in tight rows from wall to wall (`puzzle`), then Fill.
+    Puzzle,
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +441,9 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
                 if s.mode == Mode::Layers {
                     layer_bin(&mut bin, items, part, rule, s, &mut rng);
                 }
+                if s.mode == Mode::Puzzle {
+                    crate::puzzle::puzzle_bin(&mut bin, items, part, rule, &mut rng);
+                }
                 fill_bin(&mut bin, items, part, &mut furthest, &bias, max_vol, s, &mut rng);
                 for (t, rest) in part.iter_mut().enumerate() {
                     types[t].append(rest);
@@ -469,6 +474,9 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
             let mut bin = BinState::new(place, pi, rule);
             if s.mode == Mode::Layers {
                 layer_bin(&mut bin, items, &mut types, rule, s, &mut rng);
+            }
+            if s.mode == Mode::Puzzle {
+                crate::puzzle::puzzle_bin(&mut bin, items, &mut types, rule, &mut rng);
             }
             fill_bin(&mut bin, items, &mut types, &mut furthest, &bias, max_vol, s, &mut rng);
             if bin.placed.is_empty() {
@@ -761,6 +769,10 @@ fn deterministic_starts(seed: u64) -> Vec<Start> {
         let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
         v.push(Start { mode: Mode::Layers, tol, min_density, order: None, bias: None, balance: false, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
     }
+    for (contact, volume, balance) in [(400.0, 300.0, false), (800.0, 150.0, false), (400.0, 300.0, true)] {
+        let wts = Weights { profile: Profile::Layer, contact, volume, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
+        v.push(Start { mode: Mode::Puzzle, tol: 0, min_density: 1.0, order: None, bias: None, balance, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
+    }
     for tol in [0, 10, 20] {
         let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
         v.push(Start { mode: Mode::Layers, tol, min_density: 0.7, order: None, bias: None, balance: true, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
@@ -800,7 +812,7 @@ fn random_start(rng: &mut Rng) -> Start {
     Start {
         order: None,
         bias: None,
-        mode: if r < 0.5 { Mode::Layers } else if r < 0.85 { Mode::Fill } else { Mode::Sequence },
+        mode: if r < 0.3 { Mode::Puzzle } else if r < 0.5 { Mode::Layers } else if r < 0.85 { Mode::Fill } else { Mode::Sequence },
         tol: [0, 5, 10, 20, 30, 50][rng.below(6)],
         min_density: 0.55 + rng.next_f64() * 0.3,
         balance: rng.next_f64() < 0.2,

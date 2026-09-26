@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod model;
 pub mod precheck;
 pub mod prep;
+mod puzzle;
 mod packer;
 mod rect2d;
 pub mod rng;

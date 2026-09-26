@@ -123,6 +123,46 @@ pub fn strictly_inside_doubled(hull: &[(i64, i64)], px2: i64, py2: i64) -> bool 
     })
 }
 
+/// Lever of a box against tipping in each direction (−x, +x, −y, +y): the distance from its
+/// centre `(cx, cy)` to the edge of the convex region it stands on, along that direction.
+/// A box tips when the line of gravity plus the transport force leaves this region, i.e.
+/// when `a · h_cg` exceeds the lever. Zero where the centre is not over the region.
+pub fn support_levers(rects: &[Rect], cx: f64, cy: f64) -> [f64; 4] {
+    let hull = hull_of_rects(rects);
+    if hull.len() < 3 {
+        return [0.0; 4];
+    }
+    // Extent of the hull along a line through the centre: horizontal (along x) or vertical.
+    let span = |along_x: bool| -> Option<(f64, f64)> {
+        let c = if along_x { cy } else { cx };
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for i in 0..hull.len() {
+            let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
+            let (a_on, a_off, b_on, b_off) = if along_x {
+                (a.0 as f64, a.1 as f64, b.0 as f64, b.1 as f64)
+            } else {
+                (a.1 as f64, a.0 as f64, b.1 as f64, b.0 as f64)
+            };
+            if (a_off - c) * (b_off - c) > 0.0 {
+                continue;
+            }
+            if (b_off - a_off).abs() < 1e-9 {
+                lo = lo.min(a_on.min(b_on));
+                hi = hi.max(a_on.max(b_on));
+            } else {
+                let v = a_on + (c - a_off) * (b_on - a_on) / (b_off - a_off);
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        (lo <= hi).then_some((lo, hi))
+    };
+    match (span(true), span(false)) {
+        (Some((x0, x1)), Some((y0, y1))) => [(cx - x0).max(0.0), (x1 - cx).max(0.0), (cy - y0).max(0.0), (y1 - cy).max(0.0)],
+        _ => [0.0; 4],
+    }
+}
+
 /// The six axis permutations of an item (ТЗ §6). Code letters name the original side on X, Y, Z.
 pub fn orientations(w: i32, d: i32, h: i32) -> Vec<([i32; 3], &'static str)> {
     let all = [

@@ -25,7 +25,7 @@ const DEPTHS: usize = 4;
 /// Widest gap (mm) a box of height `h` may leave to what holds it: it closes within the tilt
 /// allowed by `lean_gap_ok`.
 fn tol(h: i32) -> i32 {
-    (2.0 + 0.035 * h.max(0) as f64).floor() as i32
+    (1.0 + 0.03 * h.max(0) as f64).floor() as i32
 }
 
 /// A box that can stand in a layer: its upright orientation and footprint.
@@ -190,8 +190,6 @@ pub fn puzzle_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize
     let (pw, pd) = (place.width, place.depth);
     let stol = rule.support_tolerance_mm.max(0);
     let mut level = bin.base_z;
-    // Nothing in a layer may be stronger than the weakest box of the layer below it.
-    let mut cap = u8::MAX;
     loop {
         let avail = bin.max_h - level;
         if avail <= 0 {
@@ -201,7 +199,6 @@ pub fn puzzle_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize
             .iter()
             .flatten()
             .copied()
-            .filter(|&i| !rule.use_fragility || items[i].fragility <= cap)
             .collect();
         if pool.is_empty() {
             return;
@@ -248,8 +245,10 @@ pub fn puzzle_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize
                         .collect()
                 };
                 let Some(plan) = plan_layer(&ps, h, w, d, rng) else { continue };
-                // Try the whole layer on a copy; keep it only if every box passes.
+                // Try the whole layer on a copy; keep it only if every box passes, checked as a
+                // whole once the layer is complete (`BinState::batch`).
                 let mut trial = bin.clone();
+                trial.batch = true;
                 let mut top = level;
                 let mut weakest = u8::MAX;
                 let mut ok = true;
@@ -267,7 +266,8 @@ pub fn puzzle_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize
                         }
                     }
                 }
-                if !ok {
+                trial.batch = false;
+                if !ok || !trial.settle(items).is_empty() {
                     continue;
                 }
                 *bin = trial;
@@ -275,7 +275,6 @@ pub fn puzzle_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize
                 for t in types.iter_mut() {
                     t.retain(|i| !used.contains(i));
                 }
-                cap = cap.min(weakest);
                 level = top;
                 done = true;
                 break;

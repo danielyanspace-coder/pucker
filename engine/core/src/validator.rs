@@ -99,8 +99,14 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
         for (i, p) in items.iter().enumerate() {
             let foot = Rect::new(p.x, p.y, p.width, p.depth);
             let mut rects = Vec::new();
+            // Real contact (for the lever against tipping): tops right at the box bottom.
+            let mut contact = Vec::new();
+            let near = crate::bin_state::CONTACT_MM;
             if p.z - base <= stol {
                 rects.extend(foot.intersect(&Rect::new(0, 0, place.width, place.depth)));
+                if p.z - base <= near {
+                    contact.extend(rects.iter().copied());
+                }
             }
             if p.z > base {
                 for (j, q) in items.iter().enumerate() {
@@ -111,11 +117,14 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                     if let Some(r) = foot.intersect(&Rect::new(q.x, q.y, q.width, q.depth)) {
                         rects.push(r);
                         supports[i].push((j, r.area()));
+                        if top >= p.z - near {
+                            contact.push(r);
+                        }
                     }
                 }
             }
             let area = union_area(&rects);
-            levers[i] = crate::bin_state::box_levers(&rects, p.x, p.y, p.width, p.depth);
+            levers[i] = crate::bin_state::box_levers(if contact.is_empty() { &rects } else { &contact }, p.x, p.y, p.width, p.depth);
             let ratio = area as f64 / foot.area() as f64;
             let need = rule.required_support(p.width, p.depth, p.height);
             if ratio + 1e-9 < need {

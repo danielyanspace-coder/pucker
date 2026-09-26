@@ -511,8 +511,9 @@ fn layer_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize>], r
     let (pw, pd) = (place.width, place.depth);
     let area = pw as f64 * pd as f64;
     let mut level = bin.base_z;
-    // Nothing in a layer may be stronger than the weakest item of the layer below it.
-    let mut cap = u8::MAX;
+    // Fragility is checked for every pair of touching boxes when a box is placed.
+    let type_of: std::collections::HashMap<usize, usize> =
+        types.iter().enumerate().flat_map(|(t, v)| v.iter().map(move |&i| (i, t))).collect();
     // Strong classes build the lower layers first (like tiers in `fill_bin`).
     let mut tiers: Vec<u8> = if rule.use_fragility {
         types.iter().filter_map(|t| t.last().map(|&i| items[i].fragility)).collect()
@@ -528,7 +529,7 @@ fn layer_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize>], r
             return;
         }
         let live: Vec<usize> = (0..types.len())
-            .filter(|&t| types[t].last().is_some_and(|&i| !rule.use_fragility || items[i].fragility <= cap))
+            .filter(|&t| !types[t].is_empty())
             .collect();
         if live.is_empty() {
             return;
@@ -611,24 +612,37 @@ fn layer_bin(bin: &mut BinState, items: &[PrepItem], types: &mut [Vec<usize>], r
         // No dense layer for this class: let weaker classes join.
         let Some((_, _, _, plan)) = best else { break };
         let planned = plan.len();
-        let mut placed = 0;
-        let mut top = level;
-        let mut weakest = u8::MAX;
+        // The whole layer goes in first, then it is checked as a whole: a box of a layer is
+        // held by the neighbours and bonds that come with the rest of the layer.
+        let mut trial = bin.clone();
+        trial.batch = true;
+        let mut taken: Vec<(usize, usize)> = Vec::new();
         for (t, o, x, y) in plan {
             let Some(&idx) = types[t].last() else { continue };
-            if let Ok(c) = bin.try_at(items, idx, o, x, y) {
+            if let Ok(c) = trial.try_at(items, idx, o, x, y) {
                 types[t].pop();
-                bin.place(items, idx, &c);
-                placed += 1;
-                top = top.max(c.z + items[idx].orients[o].dims[2]);
-                weakest = weakest.min(items[idx].fragility);
+                trial.place(items, idx, &c);
+                taken.push((t, idx));
             }
         }
+        trial.batch = false;
+        let removed = trial.settle(items);
+        let kept = taken.iter().filter(|(_, i)| !removed.contains(i)).count();
         // A layer that mostly failed leaves an uneven surface: hand over to the gap filler.
-        if placed == 0 || (placed as f64) < 0.8 * planned as f64 {
+        if kept == 0 || (kept as f64) < 0.8 * planned as f64 {
+            for &(t, idx) in taken.iter().rev() {
+                types[t].push(idx);
+            }
             return;
         }
-        cap = cap.min(weakest);
+        // Boxes taken out go back to their types (from this layer or, rarely, below it).
+        for idx in removed {
+            if let Some(&t) = type_of.get(&idx) {
+                types[t].push(idx);
+            }
+        }
+        *bin = trial;
+        let top = bin.placed.iter().map(|p| p.z + p.h).max().unwrap_or(level);
         level = top.max(level + 1);
     }
     }
@@ -765,7 +779,8 @@ fn deterministic_starts(seed: u64) -> Vec<Start> {
         n += 1;
         seed ^ n.wrapping_mul(0x9E37_79B9)
     };
-    for (tol, min_density) in [(0, 0.75), (10, 0.75), (20, 0.7), (40, 0.7), (10, 0.6)] {
+    // Layers flat within the support tolerance let the next layer bond over them.
+    for (tol, min_density) in [(0, 0.75), (5, 0.7), (5, 0.6), (10, 0.7), (0, 0.6)] {
         let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
         v.push(Start { mode: Mode::Layers, tol, min_density, order: None, bias: None, balance: false, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
     }
@@ -813,7 +828,7 @@ fn random_start(rng: &mut Rng) -> Start {
         order: None,
         bias: None,
         mode: if r < 0.3 { Mode::Puzzle } else if r < 0.5 { Mode::Layers } else if r < 0.85 { Mode::Fill } else { Mode::Sequence },
-        tol: [0, 5, 10, 20, 30, 50][rng.below(6)],
+        tol: [0, 5, 5, 10, 20, 30][rng.below(6)],
         min_density: 0.55 + rng.next_f64() * 0.3,
         balance: rng.next_f64() < 0.2,
         key: ORDER_KEYS[rng.below(ORDER_KEYS.len())],

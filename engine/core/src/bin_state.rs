@@ -11,6 +11,9 @@ use crate::prep::PrepItem;
 const EPS: f64 = 1e-9;
 /// Side gaps narrower than this are unlikely to be filled later.
 const NARROW_GAP: i32 = 120;
+/// A top this close below a box bottom is in real contact with it (for the lever).
+pub const CONTACT_MM: i32 = 1;
+
 /// Tipping reserve (mm of lever) that counts as plenty when scoring positions.
 const RESERVE_MM: f64 = 100.0;
 const SIDE_NEG_X: usize = 0;
@@ -149,6 +152,9 @@ pub struct Candidate {
 
 #[derive(Clone)]
 pub struct BinState<'a> {
+    /// Skip the tipping check while a whole planned layer goes in; the layer is then
+    /// checked as a whole (`settle`), with every neighbour and bond in place.
+    pub batch: bool,
     pub place: &'a PackingPlace,
     pub place_index: usize,
     rule: &'a PackRule,
@@ -187,6 +193,7 @@ impl<'a> BinState<'a> {
         let gy = ((place.depth + 2 * oy) / cell + 1).max(1);
         let base_z = place.base_z();
         BinState {
+            batch: false,
             place,
             place_index,
             rule,
@@ -340,6 +347,12 @@ impl<'a> BinState<'a> {
                 self.rects.push(r);
             }
         }
+        // Tops within the tolerance count as support area (cardboard gives), but a light box
+        // only really rests on the highest ones: the lever against tipping uses those.
+        let mut contact: Vec<Rect> = Vec::new();
+        if z - self.base_z <= CONTACT_MM {
+            contact.extend(self.rects.iter().copied());
+        }
         if z > self.base_z {
             for &j in &self.buf {
                 let b = &self.placed[j];
@@ -347,12 +360,15 @@ impl<'a> BinState<'a> {
                     if let Some(r) = foot.intersect(&Rect::new(b.x, b.y, b.w, b.d)) {
                         self.rects.push(r);
                         self.sup.push((j, r.area()));
+                        if b.top() >= z - CONTACT_MM {
+                            contact.push(r);
+                        }
                     }
                 }
             }
         }
         let support = union_area(&self.rects);
-        let lever = if support >= foot_area { full_levers(w, d) } else { support_levers(&self.rects, x as f64 + w as f64 / 2.0, y as f64 + d as f64 / 2.0) };
+        let lever = box_levers(if contact.is_empty() { &self.rects } else { &contact }, x, y, w, d);
         if (support as f64) < self.rule.required_support(w, d, h) * foot_area as f64 - EPS {
             return Err(Reject::Support);
         }
@@ -385,7 +401,7 @@ impl<'a> BinState<'a> {
         let result = (|| {
             // Tipping reserve left for boxes that will stand on this one, 0..1.
             let mut reserve = 1.0;
-            if self.rule.use_lateral_stability {
+            if self.rule.use_lateral_stability && !self.batch {
                 match self.tip_check(&sup, &anch, &touch, lever, x, y, z, w, d, h, it.weight) {
                     Some(r) => reserve = r.min(RESERVE_MM) / RESERVE_MM,
                     None => return Err(Reject::Lateral),
@@ -956,6 +972,7 @@ impl<'a> BinState<'a> {
         if z - self.base_z <= stol {
             rects.extend(foot.intersect(&Rect::new(0, 0, self.place.width, self.place.depth)));
         }
+        let mut contact: Vec<Rect> = if z - self.base_z <= CONTACT_MM { rects.clone() } else { Vec::new() };
         if z > self.base_z {
             for &j in &self.buf {
                 let b = &self.placed[j];
@@ -963,6 +980,9 @@ impl<'a> BinState<'a> {
                     if let Some(r) = foot.intersect(&Rect::new(b.x, b.y, b.w, b.d)) {
                         supports.push((j, r.area()));
                         rects.push(r);
+                        if b.top() >= z - CONTACT_MM {
+                            contact.push(r);
+                        }
                     }
                 }
             }
@@ -973,7 +993,7 @@ impl<'a> BinState<'a> {
         let wall = self.wall_contact(x, y, w, d, h);
         let new_index = self.placed.len();
         let neighbours: Vec<usize> = self.buf.clone();
-        let lever = box_levers(&rects, x, y, w, d);
+        let lever = box_levers(if contact.is_empty() { &rects } else { &contact }, x, y, w, d);
         let m = it.weight;
         let loads = [m, m * (x as f64 + w as f64 / 2.0), m * (y as f64 + d as f64 / 2.0), m * (z as f64 + h as f64 / 2.0), 0.0, 0.0, 0.0, 0.0];
 
@@ -1162,11 +1182,18 @@ pub fn full_levers(w: i32, d: i32) -> [f64; 4] {
 
 /// Levers of a box at (x, y) of size w × d standing on `rects` (parts of its footprint).
 pub fn box_levers(rects: &[Rect], x: i32, y: i32, w: i32, d: i32) -> [f64; 4] {
-    if union_area(rects) >= w as i64 * d as i64 {
-        return full_levers(w, d);
-    }
-    support_levers(rects, x as f64 + w as f64 / 2.0, y as f64 + d as f64 / 2.0)
+    let l = if union_area(rects) >= w as i64 * d as i64 {
+        full_levers(w, d)
+    } else {
+        support_levers(rects, x as f64 + w as f64 / 2.0, y as f64 + d as f64 / 2.0)
+    };
+    // Cardboard edges are rounded and crush: a box tips about a line a little inside the
+    // edge of its support, not on the edge itself.
+    l.map(|v| (v - EDGE_CRUSH_MM).max(0.0))
 }
+
+/// How far inside the edge of the support a box pivots when it tips (mm).
+const EDGE_CRUSH_MM: f64 = 5.0;
 
 /// Is the box blocked from tipping in each direction, i.e. does it lean on a neighbour, wall
 /// or stretch wrap on that side? A box that could not stand on its own in that direction
@@ -1323,15 +1350,16 @@ fn contact_mid(a: &TipBox, b: &TipBox) -> f64 {
     (lo + hi) / 2.0
 }
 
-/// Largest tilt (rad) at which a box may still close a gap to what it leans on. A gap low
-/// down near the pivot takes a large tilt to close: the box topples over a low neighbour
-/// like over a kerb.
-const LEAN_TILT: f64 = 0.035;
+/// Largest tilt (rad, about 1.7°) at which a box may still close a gap to what it leans on.
+/// A gap low down near the pivot takes a large tilt to close: the box topples over a low
+/// neighbour like over a kerb. Checked in the shake test: at 2° light columns already hit
+/// their neighbour hard enough to throw the top box off.
+const LEAN_TILT: f64 = 0.03;
 
 /// Does a gap of `gap` mm to a neighbour whose contact reaches `reach` mm above the box's
 /// bottom still hold it (closes within `LEAN_TILT`)?
 pub fn lean_gap_ok(gap: i32, reach: i32) -> bool {
-    gap as f64 <= 2.0 + LEAN_TILT * reach.max(0) as f64
+    gap as f64 <= 1.0 + LEAN_TILT * reach.max(0) as f64
 }
 
 /// Gap along face `k` of `a` to `b`, and how high above `a`'s bottom their contact reaches.

@@ -42,6 +42,11 @@ pub fn union_area(rects: &[Rect]) -> i64 {
         1 => return rects[0].area(),
         _ => {}
     }
+    // Contacts under a box are usually disjoint (placed boxes never overlap): plain sum.
+    let disjoint = rects.iter().enumerate().all(|(i, a)| rects[i + 1..].iter().all(|b| a.intersect(b).is_none()));
+    if disjoint {
+        return rects.iter().map(Rect::area).sum();
+    }
     let mut xs: Vec<i64> = rects.iter().flat_map(|r| [r.x0, r.x1]).collect();
     xs.sort_unstable();
     xs.dedup();

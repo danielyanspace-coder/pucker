@@ -161,9 +161,20 @@ pub struct PackRule {
     /// A box counts as braced when this many of its 4 sides are in contact.
     pub lateral_min_braced_sides: u8,
     pub target_compactness: f64,
+    /// Hard limit on search time.
     pub time_limit_seconds: f64,
-    /// Stop after this many attempts in a row without improvement.
-    pub max_no_improve_starts: u32,
+    /// Scale the time with the task: base + per_type × distinct box types + per_item × items,
+    /// capped by the hard limit. Mixed loads are harder than many identical boxes.
+    pub auto_time: bool,
+    pub auto_time_base_seconds: f64,
+    pub auto_time_per_type_seconds: f64,
+    pub auto_time_per_item_seconds: f64,
+    /// Stop when the best has not improved for this share of the budget…
+    pub stagnation_fraction: f64,
+    /// …but never sooner than this.
+    pub min_stagnation_seconds: f64,
+    /// Share of the time reserved for repacking each place on its own at the end.
+    pub polish_fraction: f64,
     pub random_seed: Option<u64>,
 }
 
@@ -182,8 +193,14 @@ impl Default for PackRule {
             lateral_gap_mm: 20,
             lateral_min_braced_sides: 1,
             target_compactness: 0.85,
-            time_limit_seconds: 300.0,
-            max_no_improve_starts: 200,
+            time_limit_seconds: 180.0,
+            auto_time: true,
+            auto_time_base_seconds: 20.0,
+            auto_time_per_type_seconds: 0.5,
+            auto_time_per_item_seconds: 0.05,
+            stagnation_fraction: 0.35,
+            min_stagnation_seconds: 5.0,
+            polish_fraction: 0.25,
             random_seed: None,
         }
     }

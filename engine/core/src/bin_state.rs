@@ -123,6 +123,8 @@ pub struct BinState<'a> {
     pub base_z: i32,
     /// Height limit used by the search.
     pub max_h: i32,
+    /// Smallest side of any item in the task: points where such a cube does not fit are useless.
+    pub min_cube: i32,
     ox: i32,
     oy: i32,
     walls: bool,
@@ -161,6 +163,7 @@ impl<'a> BinState<'a> {
                 .collect(),
             base_z,
             max_h: place.height,
+            min_cube: 1,
             ox,
             oy,
             walls: place.has_walls(),
@@ -225,7 +228,7 @@ impl<'a> BinState<'a> {
         z
     }
 
-    /// Cheap part of the check: bounds and landing height. Fills `self.buf` with neighbours.
+    /// Cheap part of the check: bounds and landing height.
     pub fn drop_z(&mut self, x: i32, y: i32, w: i32, d: i32, h: i32) -> Result<i32, Reject> {
         let p = self.place;
         let c = self.rule.clearance_mm;
@@ -233,12 +236,22 @@ impl<'a> BinState<'a> {
         if x < -self.ox || y < -self.oy || x + w > p.width + self.ox || y + d > p.depth + self.oy {
             return Err(Reject::Bounds);
         }
-        self.query(x - c, y - c, x + w + c, y + d + c);
+        // Cells keep their boxes sorted by top, highest first: the first overlapping box of
+        // a cell is that cell's answer, and boxes not above the current best end the scan.
         let mut z = self.base_z;
-        for &j in &self.buf {
-            let b = &self.placed[j];
-            if x < b.x + b.w + c && b.x < x + w + c && y < b.y + b.d + c && b.y < y + d + c {
-                z = z.max(b.top());
+        let (cx0, cy0, cx1, cy1) = self.cells(x - c, y - c, x + w + c, y + d + c);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                for &j in &self.grid[(cy * self.gx + cx) as usize] {
+                    let b = &self.placed[j as usize];
+                    if b.top() <= z {
+                        break;
+                    }
+                    if x < b.x + b.w + c && b.x < x + w + c && y < b.y + b.d + c && b.y < y + d + c {
+                        z = b.top();
+                        break;
+                    }
+                }
             }
         }
         if z + h > self.max_h {
@@ -260,8 +273,8 @@ impl<'a> BinState<'a> {
         }
     }
 
-    /// Remaining hard constraints for a box landing at `z` (after `drop_z`, which must be the
-    /// last query). Returns the contact share and top flushness used for scoring.
+    /// Remaining hard constraints for a box landing at `z` (found by `drop_z`).
+    /// Returns the contact share, top flushness and trapped gap used for scoring.
     #[allow(clippy::too_many_arguments)]
     pub fn check(
         &mut self,
@@ -278,6 +291,9 @@ impl<'a> BinState<'a> {
         let it = &items[idx];
         let foot = Rect::new(x, y, w, d);
         let foot_area = foot.area();
+        // Neighbours for supports, trapped gaps and side contacts.
+        let g = self.rule.clearance_mm + self.rule.lateral_gap_mm;
+        self.query(x - g, y - g, x + w + g, y + d + g);
 
         // Support area (ТЗ §13) and centre of gravity inside the support polygon (ТЗ §14–15).
         self.rects.clear();
@@ -328,7 +344,7 @@ impl<'a> BinState<'a> {
 
         // Neighbours around the box: bracing (docs/DECISIONS.md §4) and scoring.
         let sup = std::mem::take(&mut self.sup);
-        let (side, flush) = self.side_contacts(x, y, z, w, d, h);
+        let (side, flush) = self.side_contacts(x, y, z, w, d, h, false);
         let result = (|| {
             if self.rule.use_lateral_stability
                 && !self.is_braced(&side, w, d, h)
@@ -386,7 +402,9 @@ impl<'a> BinState<'a> {
 
     /// Side contact area on each of the 4 sides (including rigid walls), and whether the top
     /// is flush with some touching neighbour's top.
-    fn side_contacts(&mut self, x: i32, y: i32, z: i32, w: i32, d: i32, h: i32) -> ([i64; 4], f64) {
+    /// `fresh_query = false` reuses the neighbours found by the last `drop_z`.
+    #[allow(clippy::too_many_arguments)]
+    fn side_contacts(&mut self, x: i32, y: i32, z: i32, w: i32, d: i32, h: i32, fresh_query: bool) -> ([i64; 4], f64) {
         let p = self.place;
         let g = self.rule.lateral_gap_mm + self.rule.clearance_mm;
         let mut s = [0i64; 4];
@@ -405,7 +423,9 @@ impl<'a> BinState<'a> {
             }
         }
         let mut flush = 0.0f64;
-        self.query(x - g, y - g, x + w + g, y + d + g);
+        if fresh_query {
+            self.query(x - g, y - g, x + w + g, y + d + g);
+        }
         for &j in &self.buf {
             let b = &self.placed[j];
             let oz = overlap(z, z + h, b.z, b.z + b.h);
@@ -497,12 +517,39 @@ impl<'a> BinState<'a> {
         }
         let mut best: Option<Candidate> = None;
         let mut furthest = Reject::Bounds;
+        // Seeds come sorted by the profile's main key, so a lower bound of the score grows
+        // along the list: once it cannot beat the best, the rest cannot either.
+        let slack = wts.volume * vol_share.cbrt() + wts.contact + wts.flush + wts.jitter / 2.0;
+        let min_h = items[idx].min_dim as f64;
+        let mut gone: Vec<usize> = Vec::new();
         for s in self.lowest_seeds(wts.profile, max_seeds) {
             let seed = self.seeds[s];
-            match self.try_seed(items, idx, &seed, wts, vol_share, best.as_ref().map(|b| b.score), rng) {
+            // No item fits where even the smallest possible cube does not.
+            let m = self.min_cube;
+            let (cx, cy) = seed.anchor(m, m);
+            if self.drop_z(cx, cy, m, m, m).is_err() {
+                gone.push(s);
+                continue;
+            }
+            if let Some(b) = &best {
+                let lower = match wts.profile {
+                    Profile::Layer => 5.0 * (seed.z - self.base_z) as f64 + min_h,
+                    Profile::Wall => 4.0 * (seed.y - seed.my as i32) as f64,
+                } - slack;
+                if lower >= b.score {
+                    break;
+                }
+            }
+            match self.try_seed(items, idx, &seed, wts, vol_share, best.as_ref().map(|b| b.score), false, rng) {
                 Ok(Some(c)) => best = Some(c),
                 Ok(None) => {}
                 Err(r) => furthest = furthest.max(r),
+            }
+        }
+        if !gone.is_empty() {
+            gone.sort_unstable();
+            for &g in gone.iter().rev() {
+                self.seeds.swap_remove(g);
             }
         }
         best.ok_or(furthest)
@@ -518,6 +565,7 @@ impl<'a> BinState<'a> {
         wts: &Weights,
         vol_share: f64,
         bound: Option<f64>,
+        need_feasible: bool,
         rng: &mut crate::rng::Rng,
     ) -> Result<Option<Candidate>, Reject> {
         let mut best: Option<Candidate> = None;
@@ -525,9 +573,18 @@ impl<'a> BinState<'a> {
         let mut furthest = Reject::Bounds;
         let max_bonus = wts.contact + wts.flush;
         let vol_bonus = wts.volume * vol_share.cbrt();
+        let cur0 = bound;
         for oi in 0..items[idx].orients.len() {
             let [w, d, h] = items[idx].orients[oi].dims;
             let (sx, sy) = seed.anchor(w, d);
+            // The box lands no lower than the surface at the seed, and the position score
+            // only grows with height: a cheap bound before the landing search.
+            let cur = best.as_ref().map(|b| b.score).or(cur0);
+            if (feasible || !need_feasible) && cur.is_some_and(|c| {
+                self.position_score(wts.profile, sx, sy, seed.z, w, d, h) - vol_bonus - max_bonus - wts.jitter / 2.0 >= c
+            }) {
+                continue;
+            }
             let z = match self.drop_z(sx, sy, w, d, h) {
                 Ok(z) => z,
                 Err(r) => {
@@ -538,7 +595,9 @@ impl<'a> BinState<'a> {
             let pos = self.position_score(wts.profile, sx, sy, z, w, d, h) - vol_bonus;
             let cur = best.as_ref().map(|b| b.score).or(bound);
             let optimistic = pos - max_bonus - wts.jitter / 2.0;
-            if cur.is_some_and(|c| optimistic >= c) && feasible {
+            // Fill mode needs to know whether the seed works at all (to retire dead seeds),
+            // so it checks until one orientation is feasible; sequence mode only needs the best.
+            if cur.is_some_and(|c| optimistic >= c) && (feasible || !need_feasible) {
                 continue;
             }
             match self.check(items, idx, sx, sy, z, w, d, h) {
@@ -632,7 +691,7 @@ impl<'a> BinState<'a> {
             v.select_nth_unstable_by_key(k, key);
             v.truncate(k);
         }
-        v.sort_by_key(key);
+        v.sort_unstable_by_key(key);
         v
     }
 
@@ -668,7 +727,7 @@ impl<'a> BinState<'a> {
         }
         let support_area = union_area(&rects);
 
-        let (side, _) = self.side_contacts(x, y, z, w, d, h);
+        let (side, _) = self.side_contacts(x, y, z, w, d, h, true);
         let neighbours: Vec<usize> = self.buf.clone();
         let braced = self.is_braced(&side, w, d, h);
         let margin = if braced { f64::INFINITY } else { self.stack_margin(&supports, w, d, h) };
@@ -742,7 +801,10 @@ impl<'a> BinState<'a> {
         let (cx0, cy0, cx1, cy1) = self.cells(x - c, y - c, x + w + c, y + d + c);
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
-                self.grid[(cy * self.gx + cx) as usize].push(new_index as u32);
+                let top = z + h;
+                let cell = &mut self.grid[(cy * self.gx + cx) as usize];
+                let at = cell.partition_point(|&j| self.placed[j as usize].top() >= top);
+                cell.insert(at, new_index as u32);
             }
         }
         self.weight += it.weight;

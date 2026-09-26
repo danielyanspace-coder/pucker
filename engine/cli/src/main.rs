@@ -40,8 +40,9 @@ enum Cmd {
     },
     /// Прогнать эталонный набор задач (ТЗ §39)
     Bench {
-        #[arg(long, default_value_t = 10.0)]
-        time_limit: f64,
+        /// Время на задачу, с. По умолчанию — по размеру задачи, не больше 3 минут
+        #[arg(long)]
+        time_limit: Option<f64>,
         /// Добавить «Пример» заказчика
         #[arg(long)]
         example: Option<String>,
@@ -74,8 +75,9 @@ struct PackArgs {
     /// Единица длины в Excel (mm|cm|m), по умолчанию из заголовков
     #[arg(long)]
     unit: Option<String>,
-    #[arg(long, default_value_t = 30.0)]
-    time_limit: f64,
+    /// Время поиска, с. По умолчанию — по размеру задачи, не больше 3 минут
+    #[arg(long)]
+    time_limit: Option<f64>,
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long, default_value_t = 0)]
@@ -235,7 +237,8 @@ fn run_pack(a: PackArgs) -> Result<(), String> {
         }
     }
     let rule = PackRule {
-        time_limit_seconds: a.time_limit,
+        time_limit_seconds: a.time_limit.unwrap_or(180.0),
+        auto_time: a.time_limit.is_none(),
         random_seed: a.seed,
         clearance_mm: a.clearance,
         use_lateral_stability: !a.no_lateral,

@@ -4,7 +4,8 @@
 //! one by one at the best feasible candidate point, opening a new place when needed.
 //! The best valid solution is kept at all times, so stopping early never loses the result.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
@@ -45,9 +46,13 @@ enum Mode {
     Fill,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Start {
     mode: Mode,
+    /// Sequence mode: explicit item order (set by local search); `None` = sort by `key`.
+    order: Option<Arc<Vec<usize>>>,
+    /// Fill mode: per-type score bonus in mm (set by local search); `None` = no bias.
+    bias: Option<Arc<Vec<f64>>>,
     /// Layer mode: how much shorter than the layer an item may be, mm.
     tol: i32,
     /// Layer mode: stop layering below this layer density.
@@ -61,6 +66,9 @@ struct Start {
     noise: f64,
     seed: u64,
 }
+
+/// Stability score at which layouts count as equally stable (see `Solution::better_than`).
+const STABLE_ENOUGH: f64 = 0.8;
 
 #[derive(Clone)]
 struct BinSol {
@@ -86,10 +94,12 @@ struct Solution {
 
 impl Solution {
     /// Lexicographic comparison (ТЗ §3, §10A.6, §21): place everything, fewest places,
-    /// smallest places, stability (in 0.05 steps), density, less overhang, lower load.
+    /// smallest places, stability, density, less overhang, lower load. Hard constraints
+    /// already make every layout physically stable, so the soft stability score only decides
+    /// below `STABLE_ENOUGH` (in 0.05 steps); above it, density decides.
     fn better_than(&self, o: &Solution) -> bool {
         use std::cmp::Ordering::*;
-        let bucket = |s: f64| (s * 20.0).round() as i64;
+        let bucket = |s: f64| (s.min(STABLE_ENOUGH) * 20.0).round() as i64;
         let ord = self
             .placed_volume
             .cmp(&o.placed_volume)
@@ -136,13 +146,18 @@ fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)],
     if s.mode != Mode::Sequence {
         return construct_fill(items, ids, pool, rule, s);
     }
-    let order = order_items(items, ids, s);
+    let order: Vec<usize> = match &s.order {
+        Some(o) => o.to_vec(),
+        None => order_items(items, ids, s),
+    };
+    let used_order = Arc::new(order.clone());
     let wts = s.wts;
     let max_vol = ids.iter().map(|&i| items[i].volume).max().unwrap_or(1).max(1) as f64;
     let mut rng = Rng::new(s.seed);
     let mut bins: Vec<BinState> = Vec::new();
     let mut used = vec![0u32; pool.len()];
     let mut unplaced = Vec::new();
+    let min_cube = ids.iter().map(|&i| items[i].min_dim).min().unwrap_or(1);
     for idx in order {
         let mut furthest = Reject::Bounds;
         let mut done = false;
@@ -165,6 +180,7 @@ fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)],
                     continue;
                 }
                 let mut nb = BinState::new(place, pi, rule);
+                nb.min_cube = min_cube;
                 match nb.best_candidate(items, idx, &wts, share, max_seeds, &mut rng) {
                     Ok(c) => {
                         nb.place(items, idx, &c);
@@ -188,7 +204,9 @@ fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)],
             BinSol { place_index: b.place_index, placed: b.placed, metrics }
         })
         .collect();
-    summarize(bins, unplaced, pool)
+    let mut sol = summarize(bins, unplaced, pool);
+    sol.start = Some(Start { order: Some(used_order), ..s.clone() });
+    sol
 }
 
 /// Identical physical units share one type so each position is tried once per type.
@@ -218,6 +236,10 @@ fn group_types(items: &[PrepItem], ids: &[usize]) -> Vec<Vec<usize>> {
 fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)], rule: &PackRule, s: &Start) -> Solution {
     let mut rng = Rng::new(s.seed);
     let mut types = group_types(items, ids);
+    let bias = match &s.bias {
+        Some(b) if b.len() == types.len() => b.clone(),
+        _ => Arc::new(vec![0.0; types.len()]),
+    };
     let max_vol = ids.iter().map(|&i| items[i].volume).max().unwrap_or(1).max(1) as f64;
     let mut furthest = vec![Reject::Bounds; types.len()];
     let mut used = vec![0u32; pool.len()];
@@ -249,7 +271,7 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
                 if s.mode == Mode::Layers {
                     layer_bin(&mut bin, items, part, rule, s, &mut rng);
                 }
-                fill_bin(&mut bin, items, part, &mut furthest, max_vol, s, &mut rng);
+                fill_bin(&mut bin, items, part, &mut furthest, &bias, max_vol, s, &mut rng);
                 for (t, rest) in part.iter_mut().enumerate() {
                     types[t].append(rest);
                 }
@@ -260,7 +282,7 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
             }
             // Leftovers first try the places already started.
             for bin in bins.iter_mut() {
-                fill_bin(bin, items, &mut types, &mut furthest, max_vol, s, &mut rng);
+                fill_bin(bin, items, &mut types, &mut furthest, &bias, max_vol, s, &mut rng);
             }
         }
     }
@@ -280,7 +302,7 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
             if s.mode == Mode::Layers {
                 layer_bin(&mut bin, items, &mut types, rule, s, &mut rng);
             }
-            fill_bin(&mut bin, items, &mut types, &mut furthest, max_vol, s, &mut rng);
+            fill_bin(&mut bin, items, &mut types, &mut furthest, &bias, max_vol, s, &mut rng);
             if bin.placed.is_empty() {
                 continue;
             }
@@ -306,7 +328,9 @@ fn construct_fill(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPla
             BinSol { place_index: b.place_index, placed: b.placed, metrics }
         })
         .collect();
-    summarize(done, unplaced, pool)
+    let mut sol = summarize(done, unplaced, pool);
+    sol.start = Some(Start { bias: Some(bias), ..s.clone() });
+    sol
 }
 
 /// Build flat layers bottom-up: pick the layer height whose 2D plan is densest,
@@ -454,6 +478,7 @@ fn fill_bin(
     items: &[PrepItem],
     types: &mut [Vec<usize>],
     furthest: &mut [Reject],
+    bias: &[f64],
     max_vol: f64,
     s: &Start,
     rng: &mut Rng,
@@ -498,9 +523,11 @@ fn fill_bin(
                 for &t in &allowed {
                     let idx = *types[t].last().unwrap();
                     let share = items[idx].volume as f64 / max_vol;
-                    let bound = best.as_ref().map(|b| b.0.score);
-                    match bin.try_seed(items, idx, &seed, &s.wts, share, bound, rng) {
-                        Ok(Some(c)) => {
+                    // A type bias shifts its scores; bounds are shifted the same way.
+                    let bound = best.as_ref().map(|b| b.0.score + bias[t]);
+                    match bin.try_seed(items, idx, &seed, &s.wts, share, bound, true, rng) {
+                        Ok(Some(mut c)) => {
+                            c.score -= bias[t];
                             best = Some((c, t));
                             any = true;
                         }
@@ -569,23 +596,23 @@ fn deterministic_starts(seed: u64) -> Vec<Start> {
     };
     for (tol, min_density) in [(0, 0.75), (10, 0.75), (20, 0.7), (40, 0.7), (10, 0.6)] {
         let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-        v.push(Start { mode: Mode::Layers, tol, min_density, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
+        v.push(Start { mode: Mode::Layers, tol, min_density, order: None, bias: None, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
     }
     for tol in [0, 10, 20] {
         let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-        v.push(Start { mode: Mode::Layers, tol, min_density: 0.7, balance: true, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
-        v.push(Start { mode: Mode::Fill, tol, min_density: 1.0, balance: true, key: OrderKey::FragVolume, wts, k: 6 + tol as usize / 10, noise: 0.0, seed: next() });
+        v.push(Start { mode: Mode::Layers, tol, min_density: 0.7, order: None, bias: None, balance: true, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
+        v.push(Start { mode: Mode::Fill, tol, min_density: 1.0, order: None, bias: None, balance: true, key: OrderKey::FragVolume, wts, k: 6 + tol as usize / 10, noise: 0.0, seed: next() });
     }
     for profile in [Profile::Layer, Profile::Wall] {
         for (contact, volume, flush) in [(400.0, 300.0, 150.0), (800.0, 150.0, 300.0), (250.0, 600.0, 100.0)] {
             let wts = Weights { profile, contact, volume, flush, void: 4.0, jitter: 0.0 };
-            v.push(Start { mode: Mode::Fill, tol: 0, min_density: 1.0, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
+            v.push(Start { mode: Mode::Fill, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
         }
     }
     for &key in &ORDER_KEYS {
         for profile in [Profile::Layer, Profile::Wall] {
             let wts = Weights { profile, contact: 400.0, volume: 0.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-            v.push(Start { mode: Mode::Sequence, tol: 0, min_density: 1.0, balance: false, key, wts, k: 0, noise: 0.0, seed: next() });
+            v.push(Start { mode: Mode::Sequence, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key, wts, k: 0, noise: 0.0, seed: next() });
         }
     }
     v
@@ -603,6 +630,8 @@ fn random_start(rng: &mut Rng) -> Start {
     };
     let r = rng.next_f64();
     Start {
+        order: None,
+        bias: None,
         mode: if r < 0.5 { Mode::Layers } else if r < 0.85 { Mode::Fill } else { Mode::Sequence },
         tol: [0, 5, 10, 20, 30, 50][rng.below(6)],
         min_density: 0.55 + rng.next_f64() * 0.3,
@@ -626,6 +655,8 @@ fn mutate(b: &Start, rng: &mut Rng) -> Start {
         jitter: f(b.wts.jitter.max(5.0)),
     };
     Start {
+        order: None,
+        bias: None,
         mode: b.mode,
         tol: (b.tol + [-10, -5, 0, 5, 10][rng.below(5)]).max(0),
         min_density: (b.min_density + (rng.next_f64() - 0.5) * 0.1).clamp(0.4, 0.95),
@@ -635,6 +666,97 @@ fn mutate(b: &Start, rng: &mut Rng) -> Start {
         k: (b.k as i64 + rng.below(5) as i64 - 2).clamp(2, 16) as usize,
         noise: (b.noise + (rng.next_f64() - 0.5) * 0.1).clamp(0.0, 0.5),
         seed: rng.next_u64(),
+    }
+}
+
+/// A small change of a good solution (ТЗ §32, stage 6): reorder a few items in sequence
+/// mode, re-prioritise a few item types in fill mode, tweak parameters otherwise.
+fn neighbour(items: &[PrepItem], b: &Start, rng: &mut Rng) -> Start {
+    match (b.mode, &b.order, &b.bias) {
+        (Mode::Sequence, Some(order), _) if order.len() >= 4 && rng.next_f64() < 0.4 => {
+            // Ruin and recreate the upper part: keep the first placements (same bottom),
+            // shuffle the tail inside each fragility class so strong items still go lower.
+            let mut o = order.to_vec();
+            let n = o.len();
+            let cut = n / 3 + rng.below(n - n / 3);
+            let mut tail: Vec<(u8, f64, usize)> = o[cut..]
+                .iter()
+                .enumerate()
+                .map(|(k, &i)| (items[i].fragility, k as f64 + (rng.next_f64() - 0.5) * 2.0 * (1 + rng.below(40)) as f64, i))
+                .collect();
+            tail.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.partial_cmp(&b.1).unwrap()));
+            for (k, t) in tail.into_iter().enumerate() {
+                o[cut + k] = t.2;
+            }
+            Start { order: Some(Arc::new(o)), seed: rng.next_u64(), ..b.clone() }
+        }
+        (Mode::Sequence, Some(order), _) if order.len() >= 2 => {
+            let mut o = order.to_vec();
+            let n = o.len();
+            for _ in 0..1 + rng.below(3) {
+                let window = if rng.next_f64() < 0.7 { 1 + rng.below(30.min(n - 1)) } else { n - 1 };
+                let i = rng.below(n);
+                let j = (i + 1 + rng.below(window)).min(n - 1);
+                if i == j {
+                    continue;
+                }
+                match rng.below(3) {
+                    0 => o.swap(i, j),
+                    1 => {
+                        // Move a short block from i to j.
+                        let len = (1 + rng.below(6)).min(n - i);
+                        let block: Vec<usize> = o.drain(i..i + len).collect();
+                        let at = j.min(o.len());
+                        o.splice(at..at, block);
+                    }
+                    _ => o[i..=j].reverse(),
+                }
+            }
+            Start { order: Some(Arc::new(o)), seed: rng.next_u64(), ..b.clone() }
+        }
+        (Mode::Fill, _, Some(bias)) if !bias.is_empty() => {
+            let mut v = bias.to_vec();
+            for _ in 0..1 + rng.below(4) {
+                let t = rng.below(v.len());
+                v[t] = (v[t] + (rng.next_f64() - 0.5) * 300.0).clamp(-600.0, 600.0);
+            }
+            let mut s = Start { bias: Some(Arc::new(v)), seed: rng.next_u64(), ..b.clone() };
+            if rng.next_f64() < 0.2 {
+                s.k = (s.k as i64 + rng.below(3) as i64 - 1).clamp(2, 16) as usize;
+            }
+            s
+        }
+        _ => mutate(b, rng),
+    }
+}
+
+/// Keeps the best few distinct solutions, best first.
+struct Elite {
+    list: Vec<Solution>,
+    cap: usize,
+}
+
+impl Elite {
+    fn offer(&mut self, s: Solution) {
+        let same = |a: &Solution| a.placed_volume == s.placed_volume && a.bins.len() == s.bins.len() && (a.compactness - s.compactness).abs() < 1e-9;
+        if self.list.iter().any(same) {
+            return;
+        }
+        let pos = self.list.iter().position(|e| s.better_than(e)).unwrap_or(self.list.len());
+        if pos < self.cap {
+            self.list.insert(pos, s);
+            self.list.truncate(self.cap);
+        }
+    }
+
+    /// Parent for the next move: biased toward the best.
+    fn pick(&self, rng: &mut Rng) -> Option<&Solution> {
+        if self.list.is_empty() {
+            return None;
+        }
+        let a = rng.below(self.list.len());
+        let b = rng.below(self.list.len());
+        self.list.get(a.min(b))
     }
 }
 
@@ -651,36 +773,39 @@ fn search(
     pool: &[(usize, &PackingPlace)],
     rule: &PackRule,
     seed: u64,
-    deadline: Instant,
+    budget: Duration,
 ) -> SearchOutcome {
+    let t0 = Instant::now();
+    let deadline = t0 + budget;
+    // Stop early when the best has not improved for a while (docs/DECISIONS.md §5b).
+    let patience = Duration::from_secs_f64((budget.as_secs_f64() * rule.stagnation_fraction).max(rule.min_stagnation_seconds));
     let mut rng = Rng::new(seed);
-    let first = deterministic_starts(seed);
     let threads = rayon::current_num_threads().max(1);
-    let mut best: Option<Solution> = None;
+    let mut queue = deterministic_starts(seed);
+    let mut elite = Elite { list: Vec::new(), cap: (threads * 2).max(6) };
     let mut iterations = 0u64;
     let mut best_at = 0u64;
-    let mut no_improve = 0u32;
-    let mut queue = first;
+    let mut improved_at = Instant::now();
     let mut first_at = None;
     loop {
-        let batch: Vec<Start> = if queue.is_empty() {
-            // Half exploration, half small changes around the best solution so far.
-            let around = best.as_ref().and_then(|b| b.start);
+        // First the fixed starts, then mostly local search around the elite, with some
+        // fresh random starts (more of them early on) to keep diversity.
+        let explore = if t0.elapsed() < budget / 4 { 0.4 } else { 0.15 };
+        let batch: Vec<Start> = if !queue.is_empty() {
+            queue.drain(..threads.min(queue.len())).collect()
+        } else {
             (0..threads.max(2))
-                .map(|i| match around {
-                    Some(b) if i % 2 == 0 => mutate(&b, &mut rng),
+                .map(|_| match elite.pick(&mut rng).and_then(|p| p.start.clone()) {
+                    Some(p) if rng.next_f64() >= explore => neighbour(items, &p, &mut rng),
                     _ => random_start(&mut rng),
                 })
                 .collect()
-        } else {
-            queue.drain(..threads.min(queue.len())).collect()
         };
         let sols: Vec<Solution> = batch
             .par_iter()
             .map(|s| {
                 let t = Instant::now();
-                let mut sol = construct(items, ids, pool, rule, s);
-                sol.start = Some(*s);
+                let sol = construct(items, ids, pool, rule, s);
                 // Per-attempt profiling: PUCKER_TRACE=1 pucker pack …
                 if std::env::var("PUCKER_TRACE").is_ok() {
                     eprintln!("{:?} tol={} k={} balance={} {:.2}s placed={} bins={} compact={:.3}", s.mode, s.tol, s.k, s.balance, t.elapsed().as_secs_f64(), sol.placed_count, sol.bins.len(), sol.compactness);
@@ -690,22 +815,56 @@ fn search(
             .collect();
         for s in sols {
             iterations += 1;
-            if best.as_ref().map_or(true, |b| s.better_than(b)) {
-                best = Some(s);
+            if elite.list.first().map_or(true, |b| s.better_than(b)) {
                 best_at = iterations;
-                no_improve = 0;
-            } else {
-                no_improve += 1;
+                improved_at = Instant::now();
+                if std::env::var("PUCKER_TRACE").is_ok() {
+                    let st = s.start.as_ref().unwrap();
+                    eprintln!("BEST {:.1}s #{} {:?} order={} bias={} bins={} compact={:.4}", t0.elapsed().as_secs_f64(), iterations, st.mode, st.order.is_some() && st.noise == 0.0, st.bias.as_ref().is_some_and(|b| b.iter().any(|&x| x != 0.0)), s.bins.len(), s.compactness);
+                }
             }
+            elite.offer(s);
         }
         first_at.get_or_insert_with(Instant::now);
-        let b = best.as_ref().unwrap();
+        let b = &elite.list[0];
         let perfect = b.unplaced.is_empty() && b.bins.len() <= 1 && b.compactness >= 0.999;
-        if perfect || Instant::now() >= deadline || no_improve >= rule.max_no_improve_starts || ids.is_empty() {
+        let now = Instant::now();
+        if perfect || now >= deadline || (queue.is_empty() && now - improved_at >= patience) || ids.is_empty() {
             break;
         }
     }
-    SearchOutcome { best: best.unwrap(), iterations, best_at, first_at: first_at.unwrap() }
+    SearchOutcome { best: elite.list.swap_remove(0), iterations, best_at, first_at: first_at.unwrap() }
+}
+
+/// With the split of items between places fixed, repack every place on its own with a
+/// dedicated search (worst places first) and keep the new layout when it is better.
+fn polish(items: &[PrepItem], mut sol: Solution, places: &[PackingPlace], rule: &PackRule, seed: u64, until: Instant) -> (Solution, u64) {
+    let mut iterations = 0;
+    let mut order: Vec<usize> = (0..sol.bins.len()).collect();
+    order.sort_by(|&a, &b| sol.bins[a].metrics.compactness.partial_cmp(&sol.bins[b].metrics.compactness).unwrap());
+    for (n, &b) in order.iter().enumerate() {
+        let now = Instant::now();
+        if now + Duration::from_millis(200) >= until {
+            break;
+        }
+        let share = (until - now) / (order.len() - n) as u32;
+        let pi = sol.bins[b].place_index;
+        let single = PackingPlace { quantity: 1, ..places[pi].clone() };
+        let pool = [(pi, &single)];
+        let ids: Vec<usize> = sol.bins[b].placed.iter().map(|p| p.item).collect();
+        let out = search(items, &ids, &pool, rule, seed ^ (0xB0 + b as u64), share);
+        iterations += out.iterations;
+        let old = summarize(vec![sol.bins[b].clone()], Vec::new(), &pool);
+        let new = out.best;
+        if new.unplaced.is_empty() && new.bins.len() == 1 && new.better_than(&old) {
+            sol.bins[b] = new.bins.into_iter().next().unwrap();
+        }
+    }
+    let all: Vec<(usize, &PackingPlace)> = places.iter().enumerate().collect();
+    let start = sol.start.take();
+    let mut sol = summarize(sol.bins, sol.unplaced, &all);
+    sol.start = start;
+    (sol, iterations)
 }
 
 /// Run the packing engine end to end: prechecks, search, metrics, validation.
@@ -749,16 +908,25 @@ pub fn pack(req: &PackingRequest) -> Result<PackingResult, String> {
         warnings.extend(capacity_warnings(&sub, &pool));
     }
 
-    let total_budget = rule.time_limit_seconds.max(0.1);
+    // Bigger tasks get more time, never more than the hard limit (docs/DECISIONS.md §5b).
+    let total_budget = if rule.auto_time {
+        let kinds = group_types(&items, &ids).len() as f64;
+        (rule.auto_time_base_seconds + rule.auto_time_per_type_seconds * kinds + rule.auto_time_per_item_seconds * ids.len() as f64)
+            .min(rule.time_limit_seconds)
+    } else {
+        rule.time_limit_seconds
+    }
+    .max(0.1);
     let mut best: Option<Solution> = None;
     let mut iterations = 0;
     let mut best_at = 0;
     let mut first_solution = None;
+    // Most of the time goes to the global search, the rest to polishing each place.
+    let search_budget = total_budget * (1.0 - rule.polish_fraction);
     for (k, pool) in pools.iter().enumerate() {
-        let left = total_budget - t0.elapsed().as_secs_f64();
+        let left = search_budget - t0.elapsed().as_secs_f64();
         let share = left / (pools.len() - k) as f64;
-        let deadline = Instant::now() + std::time::Duration::from_secs_f64(share.max(0.05));
-        let out = search(&items, &ids, pool, rule, seed.wrapping_add(k as u64), deadline);
+        let out = search(&items, &ids, pool, rule, seed.wrapping_add(k as u64), Duration::from_secs_f64(share.max(0.05)));
         iterations += out.iterations;
         first_solution.get_or_insert((out.first_at - t0).as_secs_f64());
         if best.as_ref().map_or(true, |b| out.best.better_than(b)) {
@@ -767,6 +935,9 @@ pub fn pack(req: &PackingRequest) -> Result<PackingResult, String> {
         }
     }
     let best = best.unwrap();
+    let until = t0 + Duration::from_secs_f64(total_budget);
+    let (best, polish_iterations) = polish(&items, best, places, rule, seed, until);
+    iterations += polish_iterations;
 
     let mut result = build_result(req, &items, best, pre_unplaced, warnings, t0, iterations, best_at, seed);
     result.diagnostics.first_solution_time = first_solution.unwrap_or(0.0);

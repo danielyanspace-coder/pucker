@@ -52,13 +52,18 @@ fn random_types(rng: &mut Rng, n_types: usize, min: i32, max: i32, total: usize)
         .collect()
 }
 
-pub fn scenarios(presets: &[PackingPlace], example: Option<Vec<Item>>, time_limit: f64) -> Vec<Scenario> {
+pub fn scenarios(presets: &[PackingPlace], example: Option<Vec<Item>>, time_limit: Option<f64>) -> Vec<Scenario> {
     let place = |id: &str, q: u32| {
         let mut p = presets.iter().find(|p| p.id == id).unwrap().clone();
         p.quantity = q;
         p
     };
-    let rule = PackRule { time_limit_seconds: time_limit, random_seed: Some(7), ..PackRule::default() };
+    let rule = PackRule {
+        time_limit_seconds: time_limit.unwrap_or(180.0),
+        auto_time: time_limit.is_none(),
+        random_seed: Some(7),
+        ..PackRule::default()
+    };
     let req = |items: Vec<Item>, places: Vec<PackingPlace>| PackingRequest {
         items,
         packing_place_mode: PackingPlaceMode::FixedPackingPlace,

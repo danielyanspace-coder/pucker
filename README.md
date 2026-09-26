@@ -16,9 +16,10 @@ SaaS для расчёта трёхмерной укладки коробок н
 ```sh
 cargo build --release
 
-# Упаковать Excel на EUR-палеты (до 3 шт.), 30 секунд на поиск, 3D-отчёт в HTML
+# Упаковать Excel на EUR-палеты (до 3 шт.), 3D-отчёт в HTML.
+# Время подбирается по задаче (до 3 минут); --time-limit 30 задаёт своё.
 ./target/release/pucker pack --items benchmarks/data/example.xlsx --place PALLET_EUR:3 \
-    --time-limit 30 --out result.json --html result.html
+    --out result.json --html result.html
 
 # Автоподбор между Газелью и 20-футовым контейнером
 ./target/release/pucker pack --items benchmarks/data/example.xlsx --place GAZELLE_STANDARD \
@@ -28,7 +29,7 @@ cargo build --release
 ./target/release/pucker pack --items items.xlsx --custom 2100x4200x1900:1500:1
 
 # Эталонные задачи (ТЗ §39) и тесты
-./target/release/pucker bench --time-limit 10 --example benchmarks/data/example.xlsx
+./target/release/pucker bench --example benchmarks/data/example.xlsx
 cargo test --release
 
 # Перепроверить готовый результат независимым валидатором

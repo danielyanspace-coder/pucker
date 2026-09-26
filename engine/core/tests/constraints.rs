@@ -192,19 +192,42 @@ fn collisions_and_missing_items_are_caught() {
 
 #[test]
 fn lone_tower_is_rejected_but_braced_stack_is_fine() {
-    // Three 150×150×300 boxes stacked alone in the middle of a pallet: 900 mm on a 150 mm base.
+    // Three 250×250×300 boxes stacked alone in the middle of a pallet: 900 mm on a 250 mm base.
     let p = place(PackingPlaceType::Pallet, [800, 1200, 1800]);
-    let tower: Vec<Item> = (0..3).map(|i| item(&format!("t#{}", i), [150, 150, 300], 2.0, 5)).collect();
+    let tower: Vec<Item> = (0..3).map(|i| item(&format!("t#{}", i), [250, 250, 300], 2.0, 5)).collect();
     let req = request(tower.clone(), p.clone());
-    let layout = |req: &PackingRequest| (0..3).map(|i| at(req, &format!("t#{}", i), 300, 500, 300 * i)).collect::<Vec<_>>();
+    let layout = |req: &PackingRequest| (0..3).map(|i| at(req, &format!("t#{}", i), 50, 500, 300 * i)).collect::<Vec<_>>();
     assert!(codes(&req, layout(&req)).contains(&"TOWER".to_string()));
     // The same stack leaning on a wide block next to it is braced.
     let mut items = tower;
-    items.push(item("wall", [150, 600, 900], 20.0, 9));
+    items.push(item("wall", [500, 600, 900], 20.0, 9));
     let req = request(items, p);
     let mut l = layout(&req);
-    l.push(at(&req, "wall", 450, 300, 0));
-    assert!(codes(&req, l).is_empty());
+    l.push(at(&req, "wall", 300, 300, 0));
+    let got = codes(&req, l);
+    assert!(got.is_empty(), "{:?}", got);
+}
+
+#[test]
+fn standing_on_edge_needs_neighbours_on_both_sides() {
+    // 100×400×300 standing on its 100 mm side: height 3× the thin side.
+    let p = place(PackingPlaceType::Pallet, [800, 1200, 1800]);
+    let mk = |extra: bool| {
+        let mut v = vec![item("thin", [100, 400, 300], 3.0, 5)];
+        if extra {
+            v.push(item("l", [300, 400, 300], 5.0, 5));
+            v.push(item("r", [300, 400, 300], 5.0, 5));
+        }
+        request(v, p.clone())
+    };
+    let req = mk(false);
+    assert!(codes(&req, vec![at(&req, "thin", 300, 300, 0)]).contains(&"STANDING_FREE".to_string()));
+    // Squeezed between two boxes it is fine.
+    let req = mk(true);
+    assert!(codes(&req, vec![at(&req, "l", 0, 300, 0), at(&req, "thin", 300, 300, 0), at(&req, "r", 400, 300, 0)]).is_empty());
+    // Taller than 3× its thin side is never allowed.
+    let req = request(vec![item("pole", [100, 400, 310], 3.0, 5)], p.clone());
+    assert!(codes(&req, vec![at(&req, "pole", 0, 0, 0)]).contains(&"ON_EDGE".to_string()));
 }
 
 #[test]

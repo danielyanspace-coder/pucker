@@ -48,6 +48,9 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
             if !orientations(it.width, it.depth, it.height).iter().any(|(d, _)| *d == [p.width, p.depth, p.height]) {
                 push("BAD_ROTATION", &bin.bin_id, &p.item_id, "Размеры не совпадают ни с одним поворотом".into());
             }
+            if p.height as f64 > rule.max_item_slenderness * p.width.min(p.depth) as f64 + 1e-9 {
+                push("ON_EDGE", &bin.bin_id, &p.item_id, format!("Коробка стоит на узкой грани: высота {} мм при основании {} мм", p.height, p.width.min(p.depth)));
+            }
             if p.x < -ox || p.y < -oy || p.x + p.width > place.width + ox || p.y + p.depth > place.depth + oy {
                 push("OUT_OF_BOUNDS", &bin.bin_id, &p.item_id, "Выход за границы или превышен свес".into());
             }
@@ -112,8 +115,9 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
             }
             let area = union_area(&rects);
             let ratio = area as f64 / foot.area() as f64;
-            if ratio + 1e-9 < rule.min_support_ratio {
-                push("SUPPORT", &bin.bin_id, &p.item_id, format!("Опора {:.0}% < {:.0}%", ratio * 100.0, rule.min_support_ratio * 100.0));
+            let need = rule.required_support(p.width, p.depth, p.height);
+            if ratio + 1e-9 < need {
+                push("SUPPORT", &bin.bin_id, &p.item_id, format!("Опора {:.0}% < {:.0}%", ratio * 100.0, need * 100.0));
             } else if area < foot.area() {
                 let hull = hull_of_rects(&rects);
                 if !strictly_inside_doubled(&hull, 2 * p.x as i64 + p.width as i64, 2 * p.y as i64 + p.depth as i64) {
@@ -198,6 +202,13 @@ pub fn validate(req: &PackingRequest, res: &PackingResult) -> ValidationReport {
                         side[ia][2] += ox * oz;
                         side[ib2][3] += ox * oz;
                     }
+                }
+            }
+            for (i, p) in items.iter().enumerate() {
+                if rule.is_standing(p.width, p.depth, p.height)
+                    && !crate::bin_state::enclosed(&side[i], p.width, p.depth, p.height, rule.standing_contact_ratio)
+                {
+                    push("STANDING_FREE", &bin.bin_id, &p.item_id, "Коробка стоит на ребре без соседей с обеих сторон".into());
                 }
             }
             let tan = rule.tilt_angle_deg.to_radians().tan();

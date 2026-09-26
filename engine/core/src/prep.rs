@@ -62,8 +62,11 @@ pub fn prepare(items: &[Item], rule: &PackRule) -> Result<Vec<PrepItem>, String>
             } else {
                 f64::INFINITY
             };
+            // No standing on a narrow face (docs/DECISIONS.md §4b). Lying on the largest face
+            // always passes, so every item keeps at least one orientation.
             let orients: Vec<Orient> = orientations(it.width, it.depth, it.height)
                 .into_iter()
+                .filter(|(d, _)| d[2] as f64 <= rule.max_item_slenderness * d[0].min(d[1]) as f64 + 1e-9)
                 .map(|(dims, code)| Orient { dims, code })
                 .collect();
             let mut s = [it.width, it.depth, it.height];

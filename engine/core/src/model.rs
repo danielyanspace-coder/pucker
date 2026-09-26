@@ -152,6 +152,15 @@ pub struct PackRule {
     /// Allowed load, kg per m² of the top face, for fragility classes 1..=10.
     pub top_load_pressure_kg_m2: Vec<f64>,
     pub use_lateral_stability: bool,
+    /// A box may not stand taller than this multiple of the smaller side of its base.
+    pub max_item_slenderness: f64,
+    /// A box counts as standing when its height is at least this multiple of the smaller
+    /// side of its base…
+    pub standing_ratio: f64,
+    /// …and then needs this much support…
+    pub standing_support_ratio: f64,
+    /// …and neighbours or walls covering this share of each of its two wide faces.
+    pub standing_contact_ratio: f64,
     /// Tilt angle a free-standing stack must survive.
     pub tilt_angle_deg: f64,
     /// Side counts as braced when contact covers at least this share of the face.
@@ -188,6 +197,10 @@ impl Default for PackRule {
             use_max_top_load: true,
             top_load_pressure_kg_m2: default_pressure_table(),
             use_lateral_stability: true,
+            max_item_slenderness: 3.0,
+            standing_ratio: 2.0,
+            standing_support_ratio: 0.9,
+            standing_contact_ratio: 0.5,
             tilt_angle_deg: 20.0,
             lateral_min_contact_ratio: 0.20,
             lateral_gap_mm: 20,
@@ -202,6 +215,21 @@ impl Default for PackRule {
             min_stagnation_seconds: 5.0,
             polish_fraction: 0.25,
             random_seed: None,
+        }
+    }
+}
+
+impl PackRule {
+    /// Minimum supported share of the bottom face for a box with rotated sizes `w × d × h`.
+    pub fn is_standing(&self, w: i32, d: i32, h: i32) -> bool {
+        h as f64 >= self.standing_ratio * w.min(d) as f64
+    }
+
+    pub fn required_support(&self, w: i32, d: i32, h: i32) -> f64 {
+        if self.is_standing(w, d, h) {
+            self.min_support_ratio.max(self.standing_support_ratio)
+        } else {
+            self.min_support_ratio
         }
     }
 }

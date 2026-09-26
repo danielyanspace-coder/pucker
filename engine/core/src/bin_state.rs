@@ -9,6 +9,8 @@ use crate::model::{PackRule, PackingPlace};
 use crate::prep::PrepItem;
 
 const EPS: f64 = 1e-9;
+/// Side gaps narrower than this are unlikely to be filled later.
+const NARROW_GAP: i32 = 120;
 const SIDE_NEG_X: usize = 0;
 const SIDE_POS_X: usize = 1;
 const SIDE_NEG_Y: usize = 2;
@@ -74,6 +76,8 @@ pub struct Weights {
     pub flush: f64,
     /// Penalty per mm of average empty gap trapped under the box.
     pub void: f64,
+    /// Penalty (in mm) per side facing an unfillable narrow gap.
+    pub gap: f64,
     /// Random additive noise on scores, in mm.
     pub jitter: f64,
 }
@@ -274,7 +278,7 @@ impl<'a> BinState<'a> {
     }
 
     /// Remaining hard constraints for a box landing at `z` (found by `drop_z`).
-    /// Returns the contact share, top flushness and trapped gap used for scoring.
+    /// Returns the contact share, top flushness, trapped gap and narrow side gaps for scoring.
     #[allow(clippy::too_many_arguments)]
     pub fn check(
         &mut self,
@@ -286,13 +290,13 @@ impl<'a> BinState<'a> {
         w: i32,
         d: i32,
         h: i32,
-    ) -> Result<(f64, f64, f64), Reject> {
+    ) -> Result<(f64, f64, f64, f64), Reject> {
         let p = self.place;
         let it = &items[idx];
         let foot = Rect::new(x, y, w, d);
         let foot_area = foot.area();
-        // Neighbours for supports, trapped gaps and side contacts.
-        let g = self.rule.clearance_mm + self.rule.lateral_gap_mm;
+        // Neighbours for supports, trapped gaps, side contacts and narrow gaps.
+        let g = (self.rule.clearance_mm + self.rule.lateral_gap_mm).max(NARROW_GAP);
         self.query(x - g, y - g, x + w + g, y + d + g);
 
         // Support area (ТЗ §13) and centre of gravity inside the support polygon (ТЗ §14–15).
@@ -316,7 +320,7 @@ impl<'a> BinState<'a> {
             }
         }
         let support = union_area(&self.rects);
-        if (support as f64) < self.rule.min_support_ratio * foot_area as f64 - EPS {
+        if (support as f64) < self.rule.required_support(w, d, h) * foot_area as f64 - EPS {
             return Err(Reject::Support);
         }
         if support < foot_area {
@@ -352,6 +356,10 @@ impl<'a> BinState<'a> {
             {
                 return Err(Reject::Lateral);
             }
+            // A box standing on a narrow face must be held on both of its wide faces.
+            if self.rule.use_lateral_stability && self.rule.is_standing(w, d, h) && !enclosed(&side, w, d, h, self.rule.standing_contact_ratio) {
+                return Err(Reject::Lateral);
+            }
             // For scoring, the pallet edges act like walls: aligning to them is good.
             let mut side_score = side;
             if !self.walls {
@@ -365,7 +373,7 @@ impl<'a> BinState<'a> {
             let side_total: i64 = side_score.iter().sum();
             let side_max = 2 * (w as i64 + d as i64) * h as i64;
             let contact = 0.4 * bottom + 0.6 * (side_total as f64 / side_max as f64).min(1.0);
-            Ok((contact, flush, void))
+            Ok((contact, flush, void, self.narrow_gaps(x, y, z, w, d, h)))
         })();
         self.sup = sup;
         result
@@ -398,6 +406,39 @@ impl<'a> BinState<'a> {
         }
         let total = area as f64 * (z - self.base_z) as f64;
         (total - filled).max(0.0) / area as f64
+    }
+
+    /// How much of the box's sides face a gap too narrow to fill later (a future "shaft",
+    /// ТЗ §24): per side, the gap width / NARROW_GAP when `0 < gap < NARROW_GAP`, summed.
+    /// Uses the neighbours from the last query in `check`.
+    fn narrow_gaps(&self, x: i32, y: i32, z: i32, w: i32, d: i32, h: i32) -> f64 {
+        let p = self.place;
+        // Distance to the nearest face on each side: walls or pallet edges first.
+        let mut gap = [x, p.width - (x + w), y, p.depth - (y + d)];
+        for &j in &self.buf {
+            let b = &self.placed[j];
+            if overlap(z, z + h, b.z, b.z + b.h) == 0 {
+                continue;
+            }
+            if overlap(y, y + d, b.y, b.y + b.d) > 0 {
+                if b.x + b.w <= x {
+                    gap[SIDE_NEG_X] = gap[SIDE_NEG_X].min(x - (b.x + b.w));
+                }
+                if b.x >= x + w {
+                    gap[SIDE_POS_X] = gap[SIDE_POS_X].min(b.x - (x + w));
+                }
+            }
+            if overlap(x, x + w, b.x, b.x + b.w) > 0 {
+                if b.y + b.d <= y {
+                    gap[SIDE_NEG_Y] = gap[SIDE_NEG_Y].min(y - (b.y + b.d));
+                }
+                if b.y >= y + d {
+                    gap[SIDE_POS_Y] = gap[SIDE_POS_Y].min(b.y - (y + d));
+                }
+            }
+        }
+        let slack = self.rule.lateral_gap_mm;
+        gap.iter().filter(|&&g| g > slack && g < NARROW_GAP).map(|&g| g as f64 / NARROW_GAP as f64).sum()
     }
 
     /// Side contact area on each of the 4 sides (including rigid walls), and whether the top
@@ -601,9 +642,9 @@ impl<'a> BinState<'a> {
                 continue;
             }
             match self.check(items, idx, sx, sy, z, w, d, h) {
-                Ok((contact, flush, void)) => {
+                Ok((contact, flush, void, narrow)) => {
                     feasible = true;
-                    let mut score = pos - wts.contact * contact - wts.flush * flush + wts.void * void;
+                    let mut score = pos - wts.contact * contact - wts.flush * flush + wts.void * void + wts.gap * narrow;
                     if wts.jitter > 0.0 {
                         score += wts.jitter * (rng.next_f64() - 0.5);
                     }
@@ -878,6 +919,23 @@ impl<'a> BinState<'a> {
             }
         }
         best.min(px)
+    }
+}
+
+/// Is a standing box held on both sides across its thin direction (docs/DECISIONS.md §4b)?
+/// `side` is contact area per side: -x, +x, -y, +y.
+pub fn enclosed(side: &[i64; 4], w: i32, d: i32, h: i32, ratio: f64) -> bool {
+    let fx = d as f64 * h as f64 * ratio;
+    let fy = w as f64 * h as f64 * ratio;
+    let across_x = side[SIDE_NEG_X] as f64 >= fx && side[SIDE_POS_X] as f64 >= fx;
+    let across_y = side[SIDE_NEG_Y] as f64 >= fy && side[SIDE_POS_Y] as f64 >= fy;
+    // Thin along x when w < d: it would tip over the x sides.
+    if w < d {
+        across_x
+    } else if d < w {
+        across_y
+    } else {
+        across_x || across_y
     }
 }
 

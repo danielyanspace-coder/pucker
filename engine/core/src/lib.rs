@@ -2,7 +2,7 @@
 //!
 //! Entry point: [`pack`]. The search engine and the [`validator`] are separate on purpose (ТЗ §38).
 
-mod bin_state;
+pub mod bin_state;
 pub mod geometry;
 pub mod metrics;
 pub mod model;

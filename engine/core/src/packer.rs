@@ -25,15 +25,19 @@ enum OrderKey {
     FragHeight,
     Volume,
     Weight,
+    /// Size and strength together: big items early even when fragile (they need a flat
+    /// base), strong items early among similar sizes. Weight of strength is `Start::alpha`.
+    Blend,
 }
 
-const ORDER_KEYS: [OrderKey; 6] = [
+const ORDER_KEYS: [OrderKey; 7] = [
     OrderKey::FragVolume,
     OrderKey::FragBaseArea,
     OrderKey::FragWeight,
     OrderKey::FragHeight,
     OrderKey::Volume,
     OrderKey::Weight,
+    OrderKey::Blend,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +64,8 @@ struct Start {
     /// Fill/layer modes: split the load evenly across the expected number of places first.
     balance: bool,
     key: OrderKey,
+    /// Weight of strength in `OrderKey::Blend`.
+    alpha: f64,
     wts: Weights,
     /// Seeds examined per step in fill mode.
     k: usize,
@@ -128,6 +134,7 @@ fn order_items(items: &[PrepItem], ids: &[usize], s: &Start) -> Vec<usize> {
                 OrderKey::FragHeight => (it.fragility, it.max_dim as f64),
                 OrderKey::Volume => (0, it.volume as f64),
                 OrderKey::Weight => (0, it.weight),
+                OrderKey::Blend => (0, (it.volume as f64).cbrt() * (1.0 + s.alpha * (it.fragility as f64 - 1.0) / 9.0)),
             };
             (it.priority, frag, k * noise, i)
         })
@@ -140,6 +147,64 @@ fn order_items(items: &[PrepItem], ids: &[usize], s: &Start) -> Vec<usize> {
             .then(a.3.cmp(&b.3))
     });
     keyed.into_iter().map(|k| k.3).collect()
+}
+
+/// Shared inputs of the sequence decoder.
+struct SeqCtx<'a> {
+    items: &'a [PrepItem],
+    pool: &'a [(usize, &'a PackingPlace)],
+    rule: &'a PackRule,
+    wts: Weights,
+    max_vol: f64,
+    max_seeds: usize,
+    min_cube: i32,
+}
+
+impl<'a> SeqCtx<'a> {
+    /// Place items in order, each into the first place that takes it, opening new places
+    /// as needed. Returns the items that fit nowhere.
+    fn place_all(&self, list: &[usize], bins: &mut Vec<BinState<'a>>, used: &mut [u32], rng: &mut Rng) -> Vec<(usize, Reject)> {
+        let items = self.items;
+        let mut unplaced = Vec::new();
+        for &idx in list {
+            let mut furthest = Reject::Bounds;
+            let mut done = false;
+            let share = items[idx].volume as f64 / self.max_vol;
+            for b in bins.iter_mut() {
+                match b.best_candidate(items, idx, &self.wts, share, self.max_seeds, rng) {
+                    Ok(c) => {
+                        b.place(items, idx, &c);
+                        done = true;
+                        break;
+                    }
+                    Err(r) => furthest = furthest.max(r),
+                }
+            }
+            if !done {
+                for (k, &(pi, place)) in self.pool.iter().enumerate() {
+                    if used[k] >= place.quantity || !fits_empty(&items[idx], place) {
+                        continue;
+                    }
+                    let mut nb = BinState::new(place, pi, self.rule);
+                    nb.min_cube = self.min_cube;
+                    match nb.best_candidate(items, idx, &self.wts, share, self.max_seeds, rng) {
+                        Ok(c) => {
+                            nb.place(items, idx, &c);
+                            bins.push(nb);
+                            used[k] += 1;
+                            done = true;
+                            break;
+                        }
+                        Err(r) => furthest = furthest.max(r),
+                    }
+                }
+            }
+            if !done {
+                unplaced.push((idx, furthest));
+            }
+        }
+        unplaced
+    }
 }
 
 fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)], rule: &PackRule, s: &Start) -> Solution {
@@ -156,46 +221,26 @@ fn construct(items: &[PrepItem], ids: &[usize], pool: &[(usize, &PackingPlace)],
     let mut rng = Rng::new(s.seed);
     let mut bins: Vec<BinState> = Vec::new();
     let mut used = vec![0u32; pool.len()];
-    let mut unplaced = Vec::new();
     let min_cube = ids.iter().map(|&i| items[i].min_dim).min().unwrap_or(1);
-    for idx in order {
-        let mut furthest = Reject::Bounds;
-        let mut done = false;
-        let share = items[idx].volume as f64 / max_vol;
-        // Scanning every point is best on small tasks and too slow on big ones.
-        let max_seeds = if ids.len() <= 600 { usize::MAX } else { 64 };
-        for b in bins.iter_mut() {
-            match b.best_candidate(items, idx, &wts, share, max_seeds, &mut rng) {
-                Ok(c) => {
-                    b.place(items, idx, &c);
-                    done = true;
-                    break;
-                }
-                Err(r) => furthest = furthest.max(r),
-            }
+    // Scanning every point is best on small tasks and too slow on big ones.
+    let max_seeds = if ids.len() <= 600 { usize::MAX } else { 64 };
+    let ctx = SeqCtx { items, pool, rule, wts, max_vol, max_seeds, min_cube };
+    let mut unplaced = ctx.place_all(&order, &mut bins, &mut used, &mut rng);
+    // Second chance for the first place: boxes placed there later opened new spots, so
+    // everything that went further is offered to it again, then the rest is repacked.
+    if bins.len() >= 2 || (!bins.is_empty() && !unplaced.is_empty()) {
+        let pos: std::collections::HashMap<usize, usize> = order.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let mut rest: Vec<usize> = bins
+            .drain(1..)
+            .flat_map(|b| b.placed.into_iter().map(|p| p.item))
+            .chain(unplaced.drain(..).map(|(i, _)| i))
+            .collect();
+        rest.sort_by_key(|i| pos[i]);
+        used.iter_mut().for_each(|u| *u = 0);
+        if let Some(k) = pool.iter().position(|(pi, _)| *pi == bins[0].place_index) {
+            used[k] = 1;
         }
-        if !done {
-            for (k, &(pi, place)) in pool.iter().enumerate() {
-                if used[k] >= place.quantity || !fits_empty(&items[idx], place) {
-                    continue;
-                }
-                let mut nb = BinState::new(place, pi, rule);
-                nb.min_cube = min_cube;
-                match nb.best_candidate(items, idx, &wts, share, max_seeds, &mut rng) {
-                    Ok(c) => {
-                        nb.place(items, idx, &c);
-                        bins.push(nb);
-                        used[k] += 1;
-                        done = true;
-                        break;
-                    }
-                    Err(r) => furthest = furthest.max(r),
-                }
-            }
-        }
-        if !done {
-            unplaced.push((idx, furthest));
-        }
+        unplaced = ctx.place_all(&rest, &mut bins, &mut used, &mut rng);
     }
     let bins: Vec<BinSol> = bins
         .into_iter()
@@ -595,24 +640,28 @@ fn deterministic_starts(seed: u64) -> Vec<Start> {
         seed ^ n.wrapping_mul(0x9E37_79B9)
     };
     for (tol, min_density) in [(0, 0.75), (10, 0.75), (20, 0.7), (40, 0.7), (10, 0.6)] {
-        let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-        v.push(Start { mode: Mode::Layers, tol, min_density, order: None, bias: None, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
+        let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
+        v.push(Start { mode: Mode::Layers, tol, min_density, order: None, bias: None, balance: false, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
     }
     for tol in [0, 10, 20] {
-        let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-        v.push(Start { mode: Mode::Layers, tol, min_density: 0.7, order: None, bias: None, balance: true, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
-        v.push(Start { mode: Mode::Fill, tol, min_density: 1.0, order: None, bias: None, balance: true, key: OrderKey::FragVolume, wts, k: 6 + tol as usize / 10, noise: 0.0, seed: next() });
+        let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 300.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
+        v.push(Start { mode: Mode::Layers, tol, min_density: 0.7, order: None, bias: None, balance: true, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
+        v.push(Start { mode: Mode::Fill, tol, min_density: 1.0, order: None, bias: None, balance: true, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6 + tol as usize / 10, noise: 0.0, seed: next() });
     }
     for profile in [Profile::Layer, Profile::Wall] {
         for (contact, volume, flush) in [(400.0, 300.0, 150.0), (800.0, 150.0, 300.0), (250.0, 600.0, 100.0)] {
-            let wts = Weights { profile, contact, volume, flush, void: 4.0, jitter: 0.0 };
-            v.push(Start { mode: Mode::Fill, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key: OrderKey::FragVolume, wts, k: 6, noise: 0.0, seed: next() });
+            let wts = Weights { profile, contact, volume, flush, void: 4.0, gap: 0.0, jitter: 0.0 };
+            v.push(Start { mode: Mode::Fill, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key: OrderKey::FragVolume, alpha: 1.0, wts, k: 6, noise: 0.0, seed: next() });
         }
+    }
+    for alpha in [0.3, 1.0, 2.0] {
+        let wts = Weights { profile: Profile::Layer, contact: 400.0, volume: 0.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
+        v.push(Start { mode: Mode::Sequence, order: None, bias: None, tol: 0, min_density: 1.0, balance: false, key: OrderKey::Blend, alpha, wts, k: 0, noise: 0.0, seed: next() });
     }
     for &key in &ORDER_KEYS {
         for profile in [Profile::Layer, Profile::Wall] {
-            let wts = Weights { profile, contact: 400.0, volume: 0.0, flush: 150.0, void: 4.0, jitter: 0.0 };
-            v.push(Start { mode: Mode::Sequence, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key, wts, k: 0, noise: 0.0, seed: next() });
+            let wts = Weights { profile, contact: 400.0, volume: 0.0, flush: 150.0, void: 4.0, gap: 0.0, jitter: 0.0 };
+            v.push(Start { mode: Mode::Sequence, tol: 0, min_density: 1.0, order: None, bias: None, balance: false, key, alpha: 1.0, wts, k: 0, noise: 0.0, seed: next() });
         }
     }
     v
@@ -626,6 +675,7 @@ fn random_start(rng: &mut Rng) -> Start {
         volume: rng.next_f64() * 800.0,
         flush: rng.next_f64() * 400.0,
         void: rng.next_f64() * 10.0,
+        gap: if rng.next_f64() < 0.3 { rng.next_f64() * 300.0 } else { 0.0 },
         jitter: if rng.next_f64() < 0.5 { rng.next_f64() * 60.0 } else { 0.0 },
     };
     let r = rng.next_f64();
@@ -637,6 +687,7 @@ fn random_start(rng: &mut Rng) -> Start {
         min_density: 0.55 + rng.next_f64() * 0.3,
         balance: rng.next_f64() < 0.2,
         key: ORDER_KEYS[rng.below(ORDER_KEYS.len())],
+        alpha: rng.next_f64() * 3.0,
         wts,
         k: 2 + rng.below(10),
         noise: rng.next_f64() * 0.4,
@@ -652,6 +703,7 @@ fn mutate(b: &Start, rng: &mut Rng) -> Start {
         volume: f(b.wts.volume),
         flush: f(b.wts.flush),
         void: f(b.wts.void),
+        gap: f(b.wts.gap),
         jitter: f(b.wts.jitter.max(5.0)),
     };
     Start {
@@ -662,6 +714,7 @@ fn mutate(b: &Start, rng: &mut Rng) -> Start {
         min_density: (b.min_density + (rng.next_f64() - 0.5) * 0.1).clamp(0.4, 0.95),
         balance: b.balance,
         key: if rng.next_f64() < 0.2 { ORDER_KEYS[rng.below(ORDER_KEYS.len())] } else { b.key },
+        alpha: (b.alpha + (rng.next_f64() - 0.5) * 0.6).clamp(0.0, 4.0),
         wts,
         k: (b.k as i64 + rng.below(5) as i64 - 2).clamp(2, 16) as usize,
         noise: (b.noise + (rng.next_f64() - 0.5) * 0.1).clamp(0.0, 0.5),
@@ -675,7 +728,7 @@ fn neighbour(items: &[PrepItem], b: &Start, rng: &mut Rng) -> Start {
     match (b.mode, &b.order, &b.bias) {
         (Mode::Sequence, Some(order), _) if order.len() >= 4 && rng.next_f64() < 0.4 => {
             // Ruin and recreate the upper part: keep the first placements (same bottom),
-            // shuffle the tail inside each fragility class so strong items still go lower.
+            // shuffle the tail (inside each fragility class for class-first orders).
             let mut o = order.to_vec();
             let n = o.len();
             let cut = n / 3 + rng.below(n - n / 3);
@@ -684,7 +737,11 @@ fn neighbour(items: &[PrepItem], b: &Start, rng: &mut Rng) -> Start {
                 .enumerate()
                 .map(|(k, &i)| (items[i].fragility, k as f64 + (rng.next_f64() - 0.5) * 2.0 * (1 + rng.below(40)) as f64, i))
                 .collect();
-            tail.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.partial_cmp(&b.1).unwrap()));
+            let by_class = matches!(b.key, OrderKey::FragVolume | OrderKey::FragBaseArea | OrderKey::FragWeight | OrderKey::FragHeight);
+            tail.sort_by(|x, y| {
+                let class = if by_class { y.0.cmp(&x.0) } else { std::cmp::Ordering::Equal };
+                class.then(x.1.partial_cmp(&y.1).unwrap())
+            });
             for (k, t) in tail.into_iter().enumerate() {
                 o[cut + k] = t.2;
             }

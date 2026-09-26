@@ -85,6 +85,9 @@ struct PackArgs {
     /// Разрешить свес на палете, мм
     #[arg(long)]
     overhang: Option<i32>,
+    /// Максимальное отношение высоты коробки к меньшей стороне основания
+    #[arg(long)]
+    max_slenderness: Option<f64>,
     /// Отключить проверку боковой устойчивости (башен)
     #[arg(long)]
     no_lateral: bool,
@@ -243,6 +246,7 @@ fn run_pack(a: PackArgs) -> Result<(), String> {
         clearance_mm: a.clearance,
         use_lateral_stability: !a.no_lateral,
         use_fragility: !a.no_fragility,
+        max_item_slenderness: a.max_slenderness.unwrap_or(PackRule::default().max_item_slenderness),
         use_max_top_load: !a.no_top_load,
         ..PackRule::default()
     };

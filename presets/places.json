@@ -1,0 +1,43 @@
+[
+  {
+    "id": "PALLET_EUR", "type": "PALLET", "preset_id": "PALLET_EUR", "name": "EUR-палета 1200×800",
+    "width": 800, "depth": 1200, "height": 1800, "max_payload": 1000,
+    "pallet": { "width": 800, "depth": 1200, "height": 144, "weight": 25, "max_payload": 1000 }
+  },
+  {
+    "id": "PALLET_FIN", "type": "PALLET", "preset_id": "PALLET_FIN", "name": "FIN-палета 1200×1000",
+    "width": 1000, "depth": 1200, "height": 1800, "max_payload": 1200,
+    "pallet": { "width": 1000, "depth": 1200, "height": 144, "weight": 30, "max_payload": 1200 }
+  },
+  {
+    "id": "GAZELLE_STANDARD", "type": "VAN", "preset_id": "GAZELLE_STANDARD", "name": "Газель, тент 3,0 м",
+    "width": 1950, "depth": 3000, "height": 1800, "max_payload": 1500, "door_width": 1950, "door_height": 1800
+  },
+  {
+    "id": "GAZELLE_LONG", "type": "VAN", "preset_id": "GAZELLE_LONG", "name": "Газель удлинённая, тент 4,2 м",
+    "width": 2000, "depth": 4200, "height": 2000, "max_payload": 1500
+  },
+  {
+    "id": "TRUCK_5T", "type": "TRUCK", "preset_id": "TRUCK_5T", "name": "Грузовик 5 т, 6,2 м",
+    "width": 2450, "depth": 6200, "height": 2400, "max_payload": 5000
+  },
+  {
+    "id": "TRUCK_20T", "type": "TRUCK", "preset_id": "TRUCK_20T", "name": "Еврофура 13,6 м",
+    "width": 2450, "depth": 13600, "height": 2700, "max_payload": 20000
+  },
+  {
+    "id": "CONTAINER_20FT", "type": "CONTAINER", "preset_id": "CONTAINER_20FT", "name": "Контейнер 20 футов",
+    "width": 2352, "depth": 5898, "height": 2393, "max_payload": 28200, "tare_weight": 2200,
+    "door_width": 2340, "door_height": 2280
+  },
+  {
+    "id": "CONTAINER_40FT", "type": "CONTAINER", "preset_id": "CONTAINER_40FT", "name": "Контейнер 40 футов",
+    "width": 2352, "depth": 12032, "height": 2393, "max_payload": 26700, "tare_weight": 3750,
+    "door_width": 2340, "door_height": 2280
+  },
+  {
+    "id": "CONTAINER_40FT_HIGH_CUBE", "type": "CONTAINER", "preset_id": "CONTAINER_40FT_HIGH_CUBE", "name": "Контейнер 40 футов High Cube",
+    "width": 2352, "depth": 12032, "height": 2698, "max_payload": 26460, "tare_weight": 3900,
+    "door_width": 2340, "door_height": 2585
+  }
+]
